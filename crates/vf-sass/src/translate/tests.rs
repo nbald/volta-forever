@@ -1578,3 +1578,22 @@ fn a_result_of_double_precision_is_read_no_earlier_than_volta_reads_one() {
     let through = ends(&[with_stall(board(DSETP, 0), 2, false), nop, nop], &[32], true);
     assert_eq!(through[0] + through[1], 15, "{through:?}");
 }
+
+/// A direct call's return address can be the program counter read by the LEPC immediately
+/// before it: both move with the code, so no number needs a fixup. cuDNN 9.24's sm_75 code
+/// gives direct calls so (`LEPC R128; CALL.REL`).
+#[test]
+fn a_program_counter_before_a_direct_call_is_its_return_address() {
+    let mut dec75 = Decoder::new(75);
+    // LEPC R128, as cuDNN 9.24's sm_75 code gives it.
+    let lepc = 0x008fe40000000000000000000080734eu128;
+    // CALL.REL.NOINC 0x750: its target is not followed here, only the return address is.
+    let call = 0x000fea00038000000000074000007944u128;
+    let mut items = vec![Item::new(lepc, 0, "same", false), Item::new(call, 1, "same", false)];
+    for item in &mut items {
+        item.first = true;
+        item.d = Some(dec75.decode(item.word).expect("decode"));
+    }
+    let fd = make_borrow_func(&[(&[], &[]), (&[], &[])], 128, &[], &[], false);
+    super::return_addr::return_addresses(&mut items, &[], &fd).unwrap();
+}

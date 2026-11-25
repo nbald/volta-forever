@@ -2351,6 +2351,14 @@ class Function:
         for k, item in enumerate(items):
             if item.first:
                 first_of[16 * item.origin] = k
+        # A LEPC immediately before a direct call is that call's return address: both instructions
+        # move with the code, so the address the LEPC reads stays the instruction after the call.
+        lepc_links = set()
+        for k in range(1, len(items)):
+            if not items[k].d.c.name.startswith('call_rel') or 16 * items[k].origin in self.targets:
+                continue
+            if items[k - 1].d.mnemonic == 'LEPC':
+                lepc_links.add(k - 1)
         for k, item in enumerate(items):
             name = item.d.c.name
             if name == 'brx_' and 16 * item.origin in self.tables:
@@ -2367,16 +2375,21 @@ class Function:
             elif name.startswith('call_rel') or name.startswith('jmp') or item.d.mnemonic in ('BRX', 'JMX', 'JMP'):
                 if not name.startswith('call_rel'):
                     raise Refused('%s at 0x%x: a jump that is not understood' % (item.d.mnemonic, 16 * item.origin))
-                back = 16 * item.origin + 16
-                found = [j for j in movs.get(back, [])]
-                if len(found) != 1 or found[0] > k:
-                    raise Refused('the return address of the call at 0x%x is not given by exactly one MOV' % (16 * item.origin))
-                j = found[0]
-                register = items[j].d.ops['Rd']
-                for between in items[j + 1:k]:
-                    if ('R', register) in between.d.writes or (between.first and 16 * between.origin in self.targets) or between.d.kind == 'BRU':
-                        raise Refused('the return address of the call at 0x%x does not reach it in a straight line' % (16 * item.origin))
-                items[j].fix = back
+                if k - 1 in lepc_links:
+                    # The direct call's return address is the program counter read by the LEPC
+                    # immediately before it. No number is fixed up: the LEPC moves with the code.
+                    pass
+                else:
+                    back = 16 * item.origin + 16
+                    found = [j for j in movs.get(back, [])]
+                    if len(found) != 1 or found[0] > k:
+                        raise Refused('the return address of the call at 0x%x is not given by exactly one MOV' % (16 * item.origin))
+                    j = found[0]
+                    register = items[j].d.ops['Rd']
+                    for between in items[j + 1:k]:
+                        if ('R', register) in between.d.writes or (between.first and 16 * between.origin in self.targets) or between.d.kind == 'BRU':
+                            raise Refused('the return address of the call at 0x%x does not reach it in a straight line' % (16 * item.origin))
+                    items[j].fix = back
             elif name.startswith('call_abs'):
                 # Through a register: the address to return to is the program counter (LEPC) plus the
                 # difference of two numbers, added by the IADD3 that reads the three.
@@ -2404,7 +2417,7 @@ class Function:
                     raise Refused('the call at 0x%x: its return address 0x%x is not an instruction' % (16 * item.origin, back))
                 items[values[0]].fix, items[values[1]].fix = back, 16 * items[lepc].origin
             elif item.d.mnemonic == 'LEPC':
-                if not any(items[j].d.c.name.startswith('call_abs') for j in range(k + 1, min(len(items), k + 16))):
+                if k not in lepc_links and not any(items[j].d.c.name.startswith('call_abs') for j in range(k + 1, min(len(items), k + 16))):
                     raise Refused('LEPC at 0x%x without a call after it' % (16 * item.origin))
 
     # ---- scheduling -----------------------------------------------------------------------------------------

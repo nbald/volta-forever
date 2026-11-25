@@ -1,7 +1,7 @@
 //! Return addresses: find the MOV instructions in the translated code that hold return
 //! addresses or jump-table entries, and rewrite them once the new offsets are known.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::decode::{Kind, LETTER_R};
 use crate::generated::fields::*;
@@ -25,6 +25,20 @@ pub(super) fn return_addresses(
     for (k, item) in items.iter().enumerate() {
         if let Some(v) = immediate_of(item) {
             movs.entry(v).or_default().push(k);
+        }
+    }
+
+    // A LEPC immediately before a direct call is that call's return address: both instructions
+    // move with the code, so the address the LEPC reads stays the instruction after the call.
+    let mut link_lepc: HashSet<usize> = HashSet::new();
+    for k in 1..items.len() {
+        let d = items[k].d.as_ref().unwrap();
+        if !d.name.starts_with("call_rel") || targets.contains(&(16 * items[k].origin as u64)) {
+            continue;
+        }
+        let p = items[k - 1].d.as_ref().unwrap();
+        if p.mnemonic == "LEPC" {
+            link_lepc.insert(k - 1);
         }
     }
 
@@ -74,29 +88,34 @@ pub(super) fn return_addresses(
                     16 * origin
                 )));
             }
-            let back = (16 * origin + 16) as u32;
-            let found: Vec<usize> = movs.get(&back).cloned().unwrap_or_default();
-            if found.len() != 1 || found[0] > k {
-                return Err(Refused(format!(
-                    "the return address of the call at 0x{:x} is not given by exactly one MOV",
-                    16 * origin
-                )));
-            }
-            let j = found[0];
-            let register = items[j].d.as_ref().unwrap().op_or(OP_RD, 255);
-            for between in &items[j + 1..k] {
-                let bd = between.d.as_ref().unwrap();
-                if bd.writes.iter().any(|&(l, r)| l == LETTER_R && r == register)
-                    || (between.first && targets.contains(&(16 * between.origin as u64)))
-                    || bd.kind == Kind::BRU
-                {
+            if k > 0 && link_lepc.contains(&(k - 1)) {
+                // The direct call's return address is the program counter read by the LEPC
+                // immediately before it. No number is fixed up: the LEPC moves with the code.
+            } else {
+                let back = (16 * origin + 16) as u32;
+                let found: Vec<usize> = movs.get(&back).cloned().unwrap_or_default();
+                if found.len() != 1 || found[0] > k {
                     return Err(Refused(format!(
-                        "the return address of the call at 0x{:x} does not reach it in a straight line",
+                        "the return address of the call at 0x{:x} is not given by exactly one MOV",
                         16 * origin
                     )));
                 }
+                let j = found[0];
+                let register = items[j].d.as_ref().unwrap().op_or(OP_RD, 255);
+                for between in &items[j + 1..k] {
+                    let bd = between.d.as_ref().unwrap();
+                    if bd.writes.iter().any(|&(l, r)| l == LETTER_R && r == register)
+                        || (between.first && targets.contains(&(16 * between.origin as u64)))
+                        || bd.kind == Kind::BRU
+                    {
+                        return Err(Refused(format!(
+                            "the return address of the call at 0x{:x} does not reach it in a straight line",
+                            16 * origin
+                        )));
+                    }
+                }
+                fixups.push((j, (16 * origin + 16) as u64));
             }
-            fixups.push((j, (16 * origin + 16) as u64));
         } else if d_name.starts_with("call_abs") {
             // Through a register: LEPC + IADD3 + two MOVs
             let lepc = (k.saturating_sub(15)..k)
@@ -197,7 +216,8 @@ pub(super) fn return_addresses(
             fixups.push((values[&1], 16 * lepc_origin as u64));
         } else if d_mnemonic == "LEPC" {
             let has_call = (k + 1..std::cmp::min(items.len(), k + 16))
-                .any(|j| items[j].d.as_ref().unwrap().name.starts_with("call_abs"));
+                .any(|j| items[j].d.as_ref().unwrap().name.starts_with("call_abs"))
+                || link_lepc.contains(&k);
             if !has_call {
                 return Err(Refused(format!("LEPC at 0x{:x} without a call after it", 16 * origin)));
             }
