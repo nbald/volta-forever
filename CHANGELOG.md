@@ -13,9 +13,17 @@
   `LEPC ... without a call after it`. It is translated now: the `LEPC` and the call move with the
   code, so the return address needs no number fixed up. In one cuDNN 9.24 library, 311 of the 312
   functions of the cubin that held the refused down-sample kernels were refused; all 312 translate,
-  and the CUDA 13.5 cuBLAS `volta_sgemm` kernel runs (`tests/gpu/run.sh`, `runtime-13.5-ptx`). The
-  independent validator still finds scheduling gaps in some of the newly translated cuDNN
-  functions (in the pull request); they are not fixed here.
+  and the CUDA 13.5 cuBLAS `volta_sgemm` kernel runs (`tests/gpu/run.sh`, `runtime-13.5-ptx`).
+  The independent validator first reported 1,040 "gives a predicate back" problems in the newly
+  translated cuDNN functions; they were its own rule counting `RZ` (255) as a register of the
+  translation (below).
+- `reference/validate.py` took an `R2P` that restores predicates from `RZ` for one of the
+  translation's restores: `RZ` is 255, above every register, and the rule identified a register
+  of the translation by "above the highest". cuDNN 9.24's sm_75 kernels have such `R2P`s (clear
+  predicates); the validator reported 1,040 problems on a translation that the two translators
+  agree on. `RZ` is not a register of the translation; with it excluded, the 312-function
+  cuDNN 9.24 cubin checks with 0 problems.
+>>>>>>> f941281 (validate: RZ is not a register of the translation)
 - PTX, cubins and fat binaries given to the driver's linker in files (`cuLinkAddFile`, `cuLinkAddFile_v2`) went to the driver as they were, where the same bytes given in memory (`cuLinkAddData`) are adapted: on a V100, NVIDIA's driver refuses a file of PTX for sm_75 made by CUDA 13.5 (222, `CUDA_ERROR_UNSUPPORTED_PTX_VERSION`) and one of relocatable sm_75 machine code (209, `CUDA_ERROR_NO_BINARY_FOR_GPU`), and links a fat binary of sm_75 machine code and PTX into an image without its kernels. The layer now reads such a file and gives the driver's `cuLinkAddData` what it makes of it, as of the same bytes in memory; its kernels that cannot run are refused at their lookup in the image that the link makes, with their line. The driver is given the file itself when nothing in it is adapted, when it cannot be read, and when the driver refuses what the layer made of it; a file of another type (a host object, a library of them) is not read, as such an input in memory is not (pull request #18, by midnatn). What is still not carried through a link, in memory or in a file, is in `LIMITS.md` ("Kernels refused"): a kernel whose code is a trap and nothing else, and a call into a function of another input that cannot run.
 >>>>>>> 50e4e28 (translate: a direct call's return address from the LEPC before it)
 

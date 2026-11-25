@@ -2056,7 +2056,11 @@ def schedule(mc, code, highest, sequences=frozenset(), borrowed=frozenset(), add
         # issued after it gives back. It keeps the R2P nine cycles into its block: far from any
         # writer of a predicate that ran before the block on a path the check above does not
         # follow.)
-        if d is not None and d.mnemonic == 'R2P' and d.ops.get('Ra', 0) > highest and 'Sb' in d.ops:
+        # (RZ is 255, not a register of the translation: a program's own R2P that restores from
+        # RZ, or clears predicates, is not one of the translation's restores. cuDNN 9.24's sm_75
+        # kernels have such R2Ps; they were counted as the translation's, 1,040 times.)
+        if (d is not None and d.mnemonic == 'R2P' and d.ops.get('Ra', 0) > highest
+                and d.ops.get('Ra', 0) != 255 and 'Sb' in d.ops):
             given, distance = d.ops['Sb'] & 0x7f, 0
             for j in range(k - 1, -1, -1):
                 distance += (words[j] >> USCHED) & 15
