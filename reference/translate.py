@@ -2369,8 +2369,13 @@ class Function:
                 if d.c.name not in ('ret__ABS', 'ret__ABS_UR') or d.ops.get('Ra') != register or d.ops.get('Ra_offset') != 0x20:
                     return False
                 rets += 1
-                continue
-            if any(l == 'R' and r == register for l, r in d.writes):
+                if pairing.unguarded(d):
+                    continue
+                # A guarded return is one way out; the other falls through, and must be a way
+                # back through the pair too.
+            # LEPC Rd writes the pair Rd:Rd+1, and RET.ABS Ra reads the pair: a write of either
+            # half between them makes the return address wrong.
+            if any(l == 'R' and r != 255 and (r == register or r == register + 1) for l, r in d.writes):
                 return False
             for t in flow.succ[i]:
                 if 0 <= t < len(src):
@@ -2394,7 +2399,6 @@ class Function:
         put in a register by a MOV before the call. When the code moves, so must that number. The MOV
         is found by what it does, and a function in which it is not found exactly is refused."""
         self.lepc_pairs = []
-        flow = pairing.Flow(self)
         mc, items = self.mc, self.items
         def immediate(item):
             d = item.d
@@ -2418,6 +2422,17 @@ class Function:
                 continue
             if items[k - 1].d.mnemonic == 'LEPC':
                 lepc_links.add(k - 1)
+        # The callee decides; the flow of the source is built only when there is a pair to
+        # judge. Only an accepted pair exempts its LEPC from "without a call after it".
+        flow = pairing.Flow(self) if lepc_links else None
+        accepted_lepc, accepted_call = set(), set()
+        if flow is not None and flow.known:
+            for k in lepc_links:
+                item = items[k + 1]
+                if item.target is not None and self.callee_returns_through_lepc(
+                        flow, item.target // 16, items[k].d.ops['Rd']):
+                    accepted_lepc.add(k)
+                    accepted_call.add(k + 1)
         for k, item in enumerate(items):
             name = item.d.c.name
             if name == 'brx_' and 16 * item.origin in self.tables:
@@ -2441,9 +2456,7 @@ class Function:
                 # number is one (it may be data). Otherwise the call is an ordinary one:
                 # exactly one MOV of the return address before it, reaching it in a straight
                 # line, is fixed up, as without a LEPC; none or several are refused.
-                linked = k - 1 in lepc_links
-                pair = (linked and flow.known and item.target is not None
-                        and self.callee_returns_through_lepc(flow, item.target // 16, items[k - 1].d.ops['Rd']))
+                pair = k in accepted_call
                 if pair:
                     self.lepc_pairs.append((16 * items[k - 1].origin, 16 * item.origin))
                 else:
@@ -2483,7 +2496,7 @@ class Function:
                     raise Refused('the call at 0x%x: its return address 0x%x is not an instruction' % (16 * item.origin, back))
                 items[values[0]].fix, items[values[1]].fix = back, 16 * items[lepc].origin
             elif item.d.mnemonic == 'LEPC':
-                if k not in lepc_links and not any(items[j].d.c.name.startswith('call_abs') for j in range(k + 1, min(len(items), k + 16))):
+                if k not in accepted_lepc and not any(items[j].d.c.name.startswith('call_abs') for j in range(k + 1, min(len(items), k + 16))):
                     raise Refused('LEPC at 0x%x without a call after it' % (16 * item.origin))
 
     # ---- scheduling -----------------------------------------------------------------------------------------

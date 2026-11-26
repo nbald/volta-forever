@@ -682,7 +682,7 @@ def register_lives(mc, code, texts75, tables, problems=None, name=''):
             lepc_ok = False
             if lepc_reg is not None and simple:
                 rets = [decoded[k] for k in body if decoded[k].mnemonic == 'RET']
-                written = any(any(l == 'R' and r == lepc_reg for l, r in decoded[k].writes) for k in body)
+                written = any(any(l == 'R' and r != 255 and r in (lepc_reg, lepc_reg + 1) for l, r in decoded[k].writes) for k in body)
                 returns_via_lepc = bool(rets) and not written and all(
                     r.c.name in ('ret__ABS', 'ret__ABS_UR') and r.ops.get('Ra') == lepc_reg
                     and r.ops.get('Ra_offset') == 0x20 for r in rets)

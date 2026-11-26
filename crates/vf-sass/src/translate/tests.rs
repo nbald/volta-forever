@@ -1641,16 +1641,50 @@ fn a_mov_beside_a_lepc_is_left_alone_when_the_callee_returns_through_it() {
     assert_eq!(items[0].fix, None, "the MOV is data and must not move");
 }
 
-/// When the callee does not return through the LEPC's register, the call is an ordinary one:
-/// the MOV of its return address is fixed up as without a LEPC.
+/// A LEPC that is not an accepted pair is not exempted from being a LEPC without a call after
+/// it, as on `main`: a call whose callee returns by `RET.REL` is an ordinary call, and the LEPC
+/// beside it is refused even when a MOV would give the return address.
 #[test]
-fn a_mov_beside_a_lepc_is_fixed_up_when_the_callee_does_not_return_through_it() {
+fn a_lepc_beside_an_ordinary_call_is_refused() {
     let fd = fd_from_src(&[MOV_R5_30, LEPC_R128, CALL_TO_NEXT, RET_REL]);
     let mut items = same_items(&[MOV_R5_30, LEPC_R128, CALL_TO_NEXT]);
     items[2].target = Some(0x30);
-    let (_, pairs) = super::return_addr::return_addresses(&mut items, &[], &fd).expect("the call is ordinary");
-    assert!(pairs.is_empty());
-    assert_eq!(items[0].fix, Some(0x30), "the MOV holds the call's return address");
+    assert!(super::return_addr::return_addresses(&mut items, &[], &fd).is_err());
+}
+
+/// `LEPC Rd` writes the pair `Rd:Rd+1` and `RET.ABS Ra` reads it: a callee that writes the
+/// upper half between them does not return through the pair, so the LEPC is not its return
+/// address.
+#[test]
+fn a_callee_that_writes_the_upper_half_of_the_return_address_is_not_a_pair() {
+    let mut dec75 = Decoder::new(75);
+    let mut fd = fd_from_src(&[LEPC_R128, CALL_TO_NEXT]);
+    let mut write = dec75.decode(NOP).expect("NOP");
+    write.writes = vec![(LETTER_R, 129)];
+    fd.src.push(write);
+    fd.src.push(dec75.decode(RET_ABS_R128_20).expect("RET.ABS"));
+    let mut items = same_items(&[LEPC_R128, CALL_TO_NEXT]);
+    items[1].target = Some(0x20);
+    assert!(super::return_addr::return_addresses(&mut items, &[], &fd).is_err());
+}
+
+/// A guarded `RET.ABS` is one way out; the other falls through. A callee whose fall-through
+/// returns another way does not return through the pair only.
+#[test]
+fn a_guarded_return_does_not_end_the_walk_of_the_callee() {
+    let mut dec75 = Decoder::new(75);
+    let mut fd = fd_from_src(&[LEPC_R128, CALL_TO_NEXT]);
+    let ret = dec75.decode(RET_ABS_R128_20).expect("RET.ABS");
+    let guarded_word =
+        super::util::put_operand(&ret, crate::generated::fields::OP_PG, 0, 75).expect("guard it with P0");
+    let guarded = dec75.decode(guarded_word).expect("the guarded RET");
+    assert_eq!(guarded.op_or(crate::generated::fields::OP_PG, 7), 0, "guarded by P0");
+    assert!(!crate::pairing::unguarded(&guarded), "a guard makes it fall through");
+    fd.src.push(guarded);
+    fd.src.push(dec75.decode(RET_REL).expect("RET.REL"));
+    let mut items = same_items(&[LEPC_R128, CALL_TO_NEXT]);
+    items[1].target = Some(0x20);
+    assert!(super::return_addr::return_addresses(&mut items, &[], &fd).is_err());
 }
 
 /// Without a MOV, a call whose callee does not return through the LEPC's register is refused:
@@ -1744,4 +1778,44 @@ fn a_rebuilt_turing_load_names_no_batch() {
     let cleaned = super::instruction::without_batch("ldg__sImmOffset", &d, cleared).expect("clear the batch");
     assert_eq!(batch(cleaned), 0, "a changed instruction names no batch");
     assert!(dec70.decode(cleaned).is_some());
+}
+
+/// The first build of the LEPC test kernel, kept as the refused case: its callee writes R5
+/// between `LEPC R4` and `RET.ABS R4`, and `LEPC Rd`/`RET.ABS Ra` are 64-bit pairs, so the
+/// upper half of the return address is not what the LEPC read. The translators refuse it (the
+/// LEPC is then not an accepted pair).
+#[test]
+fn the_upper_written_fixture_has_a_pair_its_callee_breaks() {
+    let mut dec75 = Decoder::new(75);
+    let image = crate::elf::Elf::parse(include_bytes!("../../../../tests/kernels/k_lepc_upper.sm75.cubin"))
+        .expect("the fixture");
+    let section = &image.sections[image.section(".text.k_lepc").expect("its code")];
+    let words: Vec<u128> = section
+        .data
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .map(|w| u128::from_le_bytes(*w))
+        .collect();
+    let lepc = words
+        .iter()
+        .position(|&w| dec75.decode(w).is_some_and(|d| d.mnemonic == "LEPC"))
+        .expect("a LEPC in the fixture");
+    let register = dec75.decode(words[lepc]).unwrap().op_or(OP_RD, 255);
+    assert!(words[lepc + 1..].iter().any(|&w| {
+        dec75.decode(w).is_some_and(|d| {
+            matches!(d.name, "ret__ABS" | "ret__ABS_UR")
+                && d.op_or(OP_RA, 255) == register
+                && d.op_or(OP_RA_OFFSET, 0) == 0x20
+        })
+    }));
+    assert!(
+        words[lepc + 1..].iter().any(|&w| {
+            dec75
+                .decode(w)
+                .is_some_and(|d| d.writes.iter().any(|&(l, r)| l == LETTER_R && r == register + 1))
+        }),
+        "the callee writes R{}",
+        register + 1
+    );
 }

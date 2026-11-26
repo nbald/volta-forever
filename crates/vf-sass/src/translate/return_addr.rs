@@ -42,8 +42,39 @@ pub(super) fn return_addresses(items: &mut [Item], targets: &[u64], fd: &FuncDat
     }
 
     // The callee of a direct call is the judge of whether an adjacent LEPC is its return
-    // address: the ways of the source say what it returns through.
-    let flow = crate::pairing::Flow::new(src, &fd.tables, &super::context::entries(fd));
+    // address: the ways of the source say what it returns through. The flow is built only when
+    // there is such a pair to judge.
+    let flow = if link_lepc.is_empty() {
+        None
+    } else {
+        Some(crate::pairing::Flow::new(src, &fd.tables, &super::context::entries(fd)))
+    };
+    let mut accepted_lepc: HashSet<usize> = HashSet::new();
+    let mut accepted_call: HashSet<usize> = HashSet::new();
+    if let Some(flow) = &flow {
+        for k in 1..items.len() {
+            if !link_lepc.contains(&(k - 1)) {
+                continue;
+            }
+            let d = items[k].d.as_ref().unwrap();
+            if !d.name.starts_with("call_rel") {
+                continue;
+            }
+            let pair = flow.known
+                && items[k].target.is_some_and(|target| {
+                    callee_returns_through_lepc(
+                        src,
+                        flow,
+                        (target / 16) as usize,
+                        items[k - 1].d.as_ref().unwrap().op_or(OP_RD, 255),
+                    )
+                });
+            if pair {
+                accepted_lepc.insert(k - 1);
+                accepted_call.insert(k);
+            }
+        }
+    }
 
     // First pass: collect fixups
     let mut fixups: Vec<(usize, u64)> = Vec::new(); // (item_index, old_offset_it_stands_for)
@@ -98,17 +129,7 @@ pub(super) fn return_addresses(items: &mut [Item], targets: &[u64], fd: &FuncDat
             // one (it may be data). Otherwise the call is an ordinary one: exactly one MOV of
             // the return address before it, reaching it in a straight line, is fixed up, as
             // without a LEPC; none or several are refused.
-            let linked = k > 0 && link_lepc.contains(&(k - 1));
-            let pair = linked
-                && flow.known
-                && items[k].target.is_some_and(|target| {
-                    callee_returns_through_lepc(
-                        src,
-                        &flow,
-                        (target / 16) as usize,
-                        items[k - 1].d.as_ref().unwrap().op_or(OP_RD, 255),
-                    )
-                });
+            let pair = accepted_call.contains(&k);
             if pair {
                 lepc_pairs.push((16 * items[k - 1].origin as u64, 16 * origin as u64));
             } else {
@@ -236,7 +257,7 @@ pub(super) fn return_addresses(items: &mut [Item], targets: &[u64], fd: &FuncDat
         } else if d_mnemonic == "LEPC" {
             let has_call = (k + 1..std::cmp::min(items.len(), k + 16))
                 .any(|j| items[j].d.as_ref().unwrap().name.starts_with("call_abs"))
-                || link_lepc.contains(&k);
+                || accepted_lepc.contains(&k);
             if !has_call {
                 return Err(Refused(format!("LEPC at 0x{:x} without a call after it", 16 * origin)));
             }
@@ -282,9 +303,19 @@ fn callee_returns_through_lepc(
                 return false;
             }
             rets += 1;
-            continue;
+            if crate::pairing::unguarded(d) {
+                continue;
+            }
+            // A guarded return is one way out; the other falls through, and must be a way
+            // back through the pair too.
         }
-        if d.writes.iter().any(|&(l, r)| l == LETTER_R && r == register) {
+        // LEPC Rd writes the pair Rd:Rd+1, and RET.ABS Ra reads the pair: a write of either
+        // half between them makes the return address wrong.
+        let upper = (register != 255).then(|| register + 1);
+        if d.writes
+            .iter()
+            .any(|&(l, r)| l == LETTER_R && r != 255 && (r == register || Some(r) == upper))
+        {
             return false;
         }
         for &t in &flow.succ[i] {

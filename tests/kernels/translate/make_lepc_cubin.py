@@ -65,14 +65,20 @@ def main():
         rets = [k for k in body if decoded[k] is not None and decoded[k].mnemonic == 'RET']
         if not rets:
             raise SystemExit('%s: the callee returns nowhere' % s.name)
+        written = set()
         for k in body:
             d = decoded[k]
             if d is None:
                 raise SystemExit('%s+0x%x does not decode' % (s.name, 16 * k))
-            if any(l == 'R' and r == register for l, r in d.writes) and k not in rets:
-                raise SystemExit('%s+0x%x writes R%d, which must hold the return address'
-                                 % (s.name, 16 * k, register))
-        # The LEPC of the same register in the MOV's place.
+            written.update(r for l, r in d.writes if l == 'R' and r != 255)
+        # `LEPC Rd` writes Rd:Rd+1 and `RET.ABS Ra` reads the pair: the callee must leave both
+        # halves alone. Prefer the MOV's register when its pair is free (the caller's code does
+        # not use it after the call), else the lowest even pair the callee does not write.
+        candidates = [register] + list(range(4, 252, 2))
+        register = next((r for r in candidates if r not in written and r + 1 not in written), None)
+        if register is None:
+            raise SystemExit('%s: the callee writes every register pair' % s.name)
+        # The LEPC of that pair in the MOV's place.
         lepc = mc.assemble('lepc_', Rd=register)
         if mc.decode(75, lepc) is None or mc.decode(75, lepc).mnemonic != 'LEPC':
             raise SystemExit('cannot make a LEPC of R%d' % register)

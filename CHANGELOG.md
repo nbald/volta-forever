@@ -19,10 +19,15 @@
   accepted pair; the translation refuses if they do. The validator checks each accepted pair by
   itself (the `RET.ABS` register and immediate, no writes, no branch at the call) and that the
   pair stays adjacent with the `LEPC` unchanged; it no longer objects to an adjacent `LEPC` whose
-  callee returns another way, which is an ordinary call. `tests/kernels/translate/k_lepc.cu`
-  and its checked-in cubin (the shape made from nvcc's `MOV` and `RET.REL` by
-  `make_lepc_cubin.py`) carry the pair for the unit tests, `compare.sh` and `controls.sh`; the
-  controls `lepc_not_adjacent` and `lepc_register_changed` are objected to on it. The
+  callee returns another way, which is an ordinary call. `LEPC Rd` writes the 64-bit pair
+  `Rd:Rd+1` and `RET.ABS Ra` reads it: a callee that writes either half does not return through
+  the pair, and a guarded `RET.ABS` is only one way out (its fall-through must return through the
+  pair too). Only an accepted pair exempts its `LEPC` from "without a call after it", as on
+  `main`. `tests/kernels/translate/k_lepc.cu` and its checked-in cubin (the shape made from
+  nvcc's `MOV` and `RET.REL` by `make_lepc_cubin.py`, in a register pair its callee leaves alone)
+  carry the pair for the unit tests, `compare.sh` and `controls.sh`; `tests/kernels/k_lepc_upper.sm75.cubin`
+  is the first build, whose callee writes the upper half, kept as the refused case. The controls
+  `lepc_not_adjacent` and `lepc_register_changed` are objected to on the pair. The
   independent validator first reported 1,040 "gives a predicate back" problems
   in the newly translated cuDNN functions; they were its own rule counting `RZ` (255) as a
   register of the translation (below).
