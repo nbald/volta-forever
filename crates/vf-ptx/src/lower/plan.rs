@@ -37,6 +37,9 @@ pub(super) struct Plan<'a> {
     pub(super) columns: HashSet<&'a str>,
     /// A operands of integer products whose row every product loads from shared memory.
     pub(super) row: HashSet<&'a str>,
+    /// Highly-reused (>= 3 products) A operands in `row` loaded once with
+    /// `ld.volatile.shared.v4.u32` and reused via `Form::Row` within the per-segment budget.
+    pub(super) cached_row: HashSet<&'a str>,
     /// Registers that some statement reads in Turing layout.
     pub(super) plain: HashSet<&'a str>,
     /// Registers that hold all ones wherever they are read: the only statement of the function that
@@ -293,6 +296,7 @@ impl<'a> Plan<'a> {
         }
         // Who reads what, and how.
         let mut gathered: HashSet<&str> = HashSet::new();
+        let mut row_uses: HashMap<&str, Vec<usize>> = HashMap::new();
         let mut products: Vec<(usize, Vec<&str>, Vec<&str>)> = Vec::new();
         for (index, guarded, opcode, operands) in statements() {
             if opcode == ".reg" {
@@ -318,6 +322,7 @@ impl<'a> Plan<'a> {
                     });
                     if options.aligned_rows && unchanged {
                         plan.row.insert(a);
+                        row_uses.entry(a).or_default().push(index);
                     } else {
                         gathered.insert(a);
                     }
@@ -335,6 +340,7 @@ impl<'a> Plan<'a> {
                         });
                         if options.aligned_rows && unchanged {
                             plan.row.insert(a_reg);
+                            row_uses.entry(a_reg).or_default().push(index);
                         } else {
                             gathered.insert(a_reg);
                         }
@@ -379,6 +385,62 @@ impl<'a> Plan<'a> {
         // One product that must gather it, and the register is gathered by all of them.
         plan.row.retain(|a| !gathered.contains(a));
         plan.plain.extend(gathered);
+
+        // Promote highly-reused (>= 3 products) `plan.row` registers to volatile-once `Form::Row`
+        // reuse up to 8 concurrently live rows per segment (<= 32 live registers) so dense MMQ
+        // tiles (e.g. 2x4, 4x4) eliminate redundant SMEM reloads across rolled and unrolled turns
+        // without hoisting spills or regressing 2-use / launch-bounds-capped kernels.
+        const ROW_CACHE_MIN_USES: usize = 3;
+        const ROW_CACHE_LIVE_BUDGET: usize = 8;
+        struct RowUse<'r> {
+            uses: usize,
+            first: usize,
+            last: usize,
+            statement: usize,
+            matrix: u32,
+            reg: &'r str,
+        }
+        let mut by_segment: HashMap<u32, Vec<RowUse<'a>>> = HashMap::new();
+        for &a_reg in &plan.row {
+            if let Some(uses) = row_uses.get(a_reg)
+                && uses.len() >= ROW_CACHE_MIN_USES
+                && let Some(origin) = plan.origins.get(a_reg)
+            {
+                let (first, last) = (uses[0], *uses.last().unwrap());
+                by_segment.entry(changes[origin.statement]).or_default().push(RowUse {
+                    uses: uses.len(),
+                    first,
+                    last,
+                    statement: origin.statement,
+                    matrix: origin.matrix,
+                    reg: a_reg,
+                });
+            }
+        }
+        for (_, mut entries) in by_segment {
+            entries.sort_by(|x, y| {
+                y.uses
+                    .cmp(&x.uses)
+                    .then_with(|| (x.last - x.first).cmp(&(y.last - y.first)))
+                    .then_with(|| x.statement.cmp(&y.statement))
+                    .then_with(|| x.matrix.cmp(&y.matrix))
+            });
+            let mut active: Vec<(usize, usize)> = Vec::new();
+            for item in entries {
+                let fits = std::iter::once(item.first)
+                    .chain(
+                        active
+                            .iter()
+                            .map(|&(s, _)| s)
+                            .filter(|&s| item.first <= s && s <= item.last),
+                    )
+                    .all(|pt| active.iter().filter(|&&(s, e)| s <= pt && pt <= e).count() < ROW_CACHE_LIVE_BUDGET);
+                if fits {
+                    active.push((item.first, item.last));
+                    plan.cached_row.insert(item.reg);
+                }
+            }
+        }
 
         // Chain detection: find runs of f32 mma.m16n8k8 products on the same accumulator in
         // straight-line code, whose A and B operands come from plain ldmatrix (in-halves form).

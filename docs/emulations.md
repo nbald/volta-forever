@@ -473,13 +473,14 @@ fragment layouts of the PTX manual.
 Kernels keep many A operands in registers through long unrolled loops, four registers for
 each. When the A operand was loaded by `ldmatrix` and nothing between the load and the
 product can change the memory (no label, no store to shared memory, no call, no barrier),
-the layer keeps only the address of the row and loads the 16 bytes at each product with
-`ld.volatile.shared.v4.u32` (marked `volatile` so the compiler does not keep the result).
-This frees the four gathered registers and eliminates stack spills: the integer kernels of
-llama.cpp's q6_K format dropped from 3.95 times the native `dp4a` kernel's time to 1.88
-(measured 2026-11-16 with llama.cpp's `test-backend-ops perf`, `tests/gpu/llamacpp-ops.sh`).
-It takes `VF_ALIGNED_ROWS` on (the default, section 3); with `VF_ALIGNED_ROWS=0` the row is
-gathered by shuffles.
+the layer keeps only the address of the row. Within each immutable shared-memory segment,
+A fragments reused across `>= 3` products are loaded once with `ld.volatile.shared.v4.u32`
+and remembered as `Form::Row` up to 8 concurrently live row fragments per segment (`32`
+registers): keeping `volatile` on the single load prevents `ptxas` from hoisting loads
+across unrolled loop turns (avoiding local-memory spills) or over-packing rolled loops,
+while dense MMA tiles (such as `2x4` and `4x4`) eliminate redundant shared-memory reloads;
+lower-reuse (`< 3`) or over-budget fragments reload per product as before. It takes `VF_ALIGNED_ROWS` on (the default, section 3); with
+`VF_ALIGNED_ROWS=0` the row is gathered by shuffles.
 
 **Test cases.** `tests/gpu/run.sh`: `tensor-core` (integer kernels among the 37),
 `ampere` (31 kernels, 0 wrong).
