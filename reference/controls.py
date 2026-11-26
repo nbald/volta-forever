@@ -454,6 +454,32 @@ def patched(control):
     kept_for_rows, whole_rows, half_of_pair, converted = Function.kept_for_rows, Function.whole_rows, Function.half_of_pair, Function.converted
     given_back = Function.given_back
 
+    NOP = 0x000fc000000000000000000000007918
+
+    def lepc_not_adjacent(self):
+        """The LEPC of a direct call and the call, with a NOP between them: the callee returns
+        into the NOP, not to it. The validator's adjacency rule for the pair must object."""
+        out = return_addresses(self)
+        for k in range(len(self.items) - 1):
+            one, two = self.items[k], self.items[k + 1]
+            if one.d is not None and two.d is not None and one.d.mnemonic == 'LEPC' and two.d.c.name.startswith('call_rel'):
+                nop = translate.Item(NOP, one.origin, 'same', changed=False)
+                nop.d = self.mc.decode(75, NOP)
+                self.items.insert(k + 1, nop)
+                break
+        return out
+
+    def lepc_register_changed(self):
+        """The LEPC of a direct call writes another register than the one the callee returns
+        through. The validator's rule for the pair must object."""
+        out = return_addresses(self)
+        for item in self.items:
+            if item.d is not None and item.d.mnemonic == 'LEPC':
+                register = item.d.ops['Rd']
+                item.word = self.put(item.d.c, item.word, 'Rd', (register + 1) & 0xff)
+                break
+        return out
+
     def alive_scratch_pred(self):
         """For each minimum (scratch_at): replace its predicate with the HIGHEST one that
         the instruction reads or writes (one that is alive there). The validator's check
@@ -859,6 +885,8 @@ def patched(control):
 
     all_controls = {
         'as it is': {},
+        'lepc_not_adjacent': {'return_addresses': lepc_not_adjacent},
+        'lepc_register_changed': {'return_addresses': lepc_register_changed},
         'unsaved': {'stand_ins': unsaved},
         'blind': {'liveness': blind},
         'cut': {'liveness': cut},
@@ -1340,6 +1368,11 @@ def patched(control):
 
 
 CONTROLS = ['as it is', 'unsaved', 'blind', 'cut', 'masks', 'nowait', 'close', 'doublesoon', 'doubleacross', 'returns', 'waitless', 'unlisted', 'swapped', 'batched', 'unmoved', 'named', 'unguarded', 'lanes', 'unwaited', 'unordered', 'complement_rewritten', 'complement_same', 'soon', 'partial', 'boardless', 'unmasked', 'early', 'unheld', 'unwritten', 'stale', 'unkept', 'unpaired', 'misruled', 'slowno', 'slowshort', 'slownowait', 'slownever', 'slowfree', 'slowsaved', 'alive_scratch']
+
+# Encodings of sm_75 that no cubin of the repository has: a direct call whose return address is
+# the program counter of the LEPC immediately before it (cuDNN 9.24's sm_75 kernels). Run them by
+# name on a cubin that has one (`controls.py -c ...`); tests/sass/controls.sh does not run them.
+LEPC_CONTROLS = ['lepc_not_adjacent', 'lepc_register_changed']
 # (Those of pairs of products on whole rows: only when the translator makes them, not with VF_PAIRS=0.)
 PAIR_CONTROLS = ['rowlane', 'otherrow', 'rowwait', 'rowread', 'halfswap', 'halfk', 'inplace', 'stepfast', 'unsettled', 'unsynced', 'unpermuted', 'unconverted', 'notalso']
 CONTROLS += PAIR_CONTROLS
@@ -2698,7 +2731,7 @@ def run(mc, control, path, out_dir, untouched, validated=True):
 def main():
     args, chosen, paths, unchecked = sys.argv[1:], [], [], False
     while args:
-        if args[0] == '-c' and len(args) > 1 and args[1] in CONTROLS:
+        if args[0] == '-c' and len(args) > 1 and (args[1] in CONTROLS or args[1] in LEPC_CONTROLS):
             chosen.append(args[1])
             args = args[2:]
         elif args[0] == '-u':
@@ -2712,7 +2745,7 @@ def main():
     ok, untouched = True, {}
     with tempfile.TemporaryDirectory(prefix='vf-controls-') as out_dir:
         print('%-10s %s' % ('control', '  '.join('%14s' % os.path.basename(p)[:14] for p in paths)))
-        for control in CONTROLS:
+        for control in CONTROLS + [c for c in LEPC_CONTROLS if c not in CONTROLS]:
             if chosen and control not in chosen and control != 'as it is':
                 continue
             if control in PAIR_CONTROLS and not translate.PAIRS:
