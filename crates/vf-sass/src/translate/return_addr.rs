@@ -88,33 +88,36 @@ pub(super) fn return_addresses(
                     16 * origin
                 )));
             }
-            if k > 0 && link_lepc.contains(&(k - 1)) {
-                // The direct call's return address is the program counter read by the LEPC
-                // immediately before it. No number is fixed up: the LEPC moves with the code.
-            } else {
-                let back = (16 * origin + 16) as u32;
-                let found: Vec<usize> = movs.get(&back).cloned().unwrap_or_default();
-                if found.len() != 1 || found[0] > k {
-                    return Err(Refused(format!(
-                        "the return address of the call at 0x{:x} is not given by exactly one MOV",
-                        16 * origin
-                    )));
+            let back = (16 * origin + 16) as u32;
+            // A MOV of the return address before the call is another way back, or the way when
+            // there is no LEPC: it is fixed up with the checks below. A LEPC immediately before
+            // the call no longer hides such a MOV, which would otherwise keep a stale address
+            // once the code moves and send a callee that returns through it to the wrong place.
+            let linked = k > 0 && link_lepc.contains(&(k - 1));
+            let mut found: Vec<usize> = Vec::new();
+            for j in movs.get(&back).cloned().unwrap_or_default() {
+                if j >= k {
+                    continue; // after the call: not this call's return address
                 }
-                let j = found[0];
                 let register = items[j].d.as_ref().unwrap().op_or(OP_RD, 255);
-                for between in &items[j + 1..k] {
+                let straight = !items[j + 1..k].iter().any(|between| {
                     let bd = between.d.as_ref().unwrap();
-                    if bd.writes.iter().any(|&(l, r)| l == LETTER_R && r == register)
+                    bd.writes.iter().any(|&(l, r)| l == LETTER_R && r == register)
                         || (between.first && targets.contains(&(16 * between.origin as u64)))
                         || bd.kind == Kind::BRU
-                    {
-                        return Err(Refused(format!(
-                            "the return address of the call at 0x{:x} does not reach it in a straight line",
-                            16 * origin
-                        )));
-                    }
+                });
+                if straight {
+                    found.push(j);
                 }
-                fixups.push((j, (16 * origin + 16) as u64));
+            }
+            if found.len() > 1 || (found.is_empty() && !linked) {
+                return Err(Refused(format!(
+                    "the return address of the call at 0x{:x} is not given by exactly one MOV",
+                    16 * origin
+                )));
+            }
+            if let Some(j) = found.first() {
+                fixups.push((*j, back as u64));
             }
         } else if d_name.starts_with("call_abs") {
             // Through a register: LEPC + IADD3 + two MOVs

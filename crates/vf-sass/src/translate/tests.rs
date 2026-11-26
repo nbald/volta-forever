@@ -1581,13 +1581,14 @@ fn a_result_of_double_precision_is_read_no_earlier_than_volta_reads_one() {
 
 /// A direct call's return address can be the program counter read by the LEPC immediately
 /// before it: both move with the code, so no number needs a fixup. cuDNN 9.24's sm_75 code
-/// gives direct calls so (`LEPC R128; CALL.REL`).
+/// gives direct calls so (`LEPC R128; CALL.REL`). The pair stays as it was, adjacent.
 #[test]
 fn a_program_counter_before_a_direct_call_is_its_return_address() {
     let mut dec75 = Decoder::new(75);
     // LEPC R128, as cuDNN 9.24's sm_75 code gives it.
     let lepc = 0x008fe40000000000000000000080734eu128;
-    // CALL.REL.NOINC 0x750: its target is not followed here, only the return address is.
+    // CALL.REL 0x760 at origin 1 (the word alone at address 0 prints 0x750): its target is not
+    // followed here, only the return address is.
     let call = 0x000fea00038000000000074000007944u128;
     let mut items = vec![Item::new(lepc, 0, "same", false), Item::new(call, 1, "same", false)];
     for item in &mut items {
@@ -1595,5 +1596,37 @@ fn a_program_counter_before_a_direct_call_is_its_return_address() {
         item.d = Some(dec75.decode(item.word).expect("decode"));
     }
     let fd = make_borrow_func(&[(&[], &[]), (&[], &[])], 128, &[], &[], false);
+    let moved = super::return_addr::return_addresses(&mut items, &[], &fd).unwrap();
+    assert!(moved.is_empty());
+    assert_eq!(items[0].word, lepc);
+    assert_eq!(items[1].word, call);
+    assert_eq!(items[1].origin, items[0].origin + 1);
+    assert_eq!(items[0].fix, None);
+}
+
+/// A MOV of a call's return address before a LEPC and the direct call is fixed up as one is
+/// without the LEPC: the LEPC does not hide it, or a callee that returns through the MOV's
+/// register would go to the old place once the code moves.
+#[test]
+fn a_mov_return_address_before_a_lepc_and_direct_call_is_fixed_up() {
+    let mut dec75 = Decoder::new(75);
+    // MOV R5, 0x30
+    let mov = 0x000fc20000000f000000003000057802u128;
+    let lepc = 0x008fe40000000000000000000080734eu128;
+    // CALL.REL at origin 2: its return address is 0x30, what the MOV holds.
+    let call = 0x000fea00038000000000074000007944u128;
+    let mut items = vec![
+        Item::new(mov, 0, "same", false),
+        Item::new(lepc, 1, "same", false),
+        Item::new(call, 2, "same", false),
+    ];
+    for item in &mut items {
+        item.first = true;
+        item.d = Some(dec75.decode(item.word).expect("decode"));
+    }
+    let fd = make_borrow_func(&[(&[], &[]), (&[], &[]), (&[], &[])], 128, &[], &[], false);
     super::return_addr::return_addresses(&mut items, &[], &fd).unwrap();
+    assert_eq!(items[0].fix, Some(0x30), "the MOV holds the call's return address");
+    assert_eq!(items[1].word, lepc);
+    assert_eq!(items[2].word, call);
 }

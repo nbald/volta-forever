@@ -2375,21 +2375,28 @@ class Function:
             elif name.startswith('call_rel') or name.startswith('jmp') or item.d.mnemonic in ('BRX', 'JMX', 'JMP'):
                 if not name.startswith('call_rel'):
                     raise Refused('%s at 0x%x: a jump that is not understood' % (item.d.mnemonic, 16 * item.origin))
-                if k - 1 in lepc_links:
-                    # The direct call's return address is the program counter read by the LEPC
-                    # immediately before it. No number is fixed up: the LEPC moves with the code.
-                    pass
-                else:
-                    back = 16 * item.origin + 16
-                    found = [j for j in movs.get(back, [])]
-                    if len(found) != 1 or found[0] > k:
-                        raise Refused('the return address of the call at 0x%x is not given by exactly one MOV' % (16 * item.origin))
-                    j = found[0]
+                back = 16 * item.origin + 16
+                # A MOV of the return address before the call is another way back, or the way
+                # when there is no LEPC: it is fixed up with the checks below. A LEPC immediately
+                # before the call no longer hides such a MOV, which would otherwise keep a stale
+                # address once the code moves and send a callee that returns through it to the
+                # wrong place.
+                linked = k - 1 in lepc_links
+                found = []
+                for j in movs.get(back, []):
+                    if j >= k:
+                        continue    # after the call: not this call's return address
                     register = items[j].d.ops['Rd']
-                    for between in items[j + 1:k]:
-                        if ('R', register) in between.d.writes or (between.first and 16 * between.origin in self.targets) or between.d.kind == 'BRU':
-                            raise Refused('the return address of the call at 0x%x does not reach it in a straight line' % (16 * item.origin))
-                    items[j].fix = back
+                    straight = not any(('R', register) in between.d.writes
+                                       or (between.first and 16 * between.origin in self.targets)
+                                       or between.d.kind == 'BRU'
+                                       for between in items[j + 1:k])
+                    if straight:
+                        found.append(j)
+                if len(found) > 1 or (not found and not linked):
+                    raise Refused('the return address of the call at 0x%x is not given by exactly one MOV' % (16 * item.origin))
+                if found:
+                    items[found[0]].fix = back
             elif name.startswith('call_abs'):
                 # Through a register: the address to return to is the program counter (LEPC) plus the
                 # difference of two numbers, added by the IADD3 that reads the three.
