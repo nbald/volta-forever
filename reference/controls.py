@@ -467,6 +467,9 @@ def patched(control):
                 nop.d = self.mc.decode(75, NOP)
                 self.items.insert(k + 1, nop)
                 break
+        # So that the translation with the filler reaches the validator: the translator's own
+        # check after scheduling would refuse it, and the point here is what the validator sees.
+        self.check_lepc_pairs = lambda: None
         return out
 
     def lepc_register_changed(self):
@@ -1369,10 +1372,11 @@ def patched(control):
 
 CONTROLS = ['as it is', 'unsaved', 'blind', 'cut', 'masks', 'nowait', 'close', 'doublesoon', 'doubleacross', 'returns', 'waitless', 'unlisted', 'swapped', 'batched', 'unmoved', 'named', 'unguarded', 'lanes', 'unwaited', 'unordered', 'complement_rewritten', 'complement_same', 'soon', 'partial', 'boardless', 'unmasked', 'early', 'unheld', 'unwritten', 'stale', 'unkept', 'unpaired', 'misruled', 'slowno', 'slowshort', 'slownowait', 'slownever', 'slowfree', 'slowsaved', 'alive_scratch']
 
-# Encodings of sm_75 that no cubin of the repository has: a direct call whose return address is
-# the program counter of the LEPC immediately before it (cuDNN 9.24's sm_75 kernels). Run them by
-# name on a cubin that has one (`controls.py -c ...`); tests/sass/controls.sh does not run them.
+# A direct call whose return address is the program counter of the LEPC immediately before it
+# (cuDNN 9.24's sm_75 kernels): tests/kernels/translate/k_lepc.sm75.cubin carries the pair, so
+# these run in the passes of tests/sass/controls.sh.
 LEPC_CONTROLS = ['lepc_not_adjacent', 'lepc_register_changed']
+CONTROLS += LEPC_CONTROLS
 # (Those of pairs of products on whole rows: only when the translator makes them, not with VF_PAIRS=0.)
 PAIR_CONTROLS = ['rowlane', 'otherrow', 'rowwait', 'rowread', 'halfswap', 'halfk', 'inplace', 'stepfast', 'unsettled', 'unsynced', 'unpermuted', 'unconverted', 'notalso']
 CONTROLS += PAIR_CONTROLS

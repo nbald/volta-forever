@@ -10,13 +10,20 @@
   code, so the return address needs no number fixed up. In one cuDNN 9.24 library, 311 of the 312
   functions of the cubin that held the refused down-sample kernels were refused; all 312 translate,
   and the CUDA 13.5 cuBLAS `volta_sgemm` kernel runs (`tests/gpu/run.sh`, `runtime-13.5-ptx`).
-  A `MOV` of the call's return address before the `LEPC` and the call is fixed up when it reaches
-  the call in a straight line, as one without a `LEPC`; one that cannot reach it is not that
-  call's return address (a cuDNN function has a `MOV` of the same constant, unrelated) and is
-  left alone. The unit test asserts the pair's bytes and adjacency. The validator checks each
-  such pair independently: the callee must return with `RET.ABS` on the `LEPC`'s register (and a
-  branch may not arrive at the call), and the pair must stay adjacent with the `LEPC` unchanged
-  in the result. The independent validator first reported 1,040 "gives a predicate back" problems
+  The callee decides whether an adjacent `LEPC` is the call's return address: when every `RET`
+  it can reach is `RET.ABS` on the `LEPC`'s register adding `0x20` and nothing of it writes that
+  register, the pair is the return address and **no `MOV` of the same number is fixed** (it may
+  be data; a cuDNN function has one); otherwise the call is an ordinary one and exactly one `MOV`
+  of its return address, before it and reaching it in a straight line, is fixed, as without a
+  `LEPC` — none or several are refused. The scheduler's fillers must not come between an
+  accepted pair; the translation refuses if they do. The validator checks each accepted pair by
+  itself (the `RET.ABS` register and immediate, no writes, no branch at the call) and that the
+  pair stays adjacent with the `LEPC` unchanged; it no longer objects to an adjacent `LEPC` whose
+  callee returns another way, which is an ordinary call. `tests/kernels/translate/k_lepc.cu`
+  and its checked-in cubin (the shape made from nvcc's `MOV` and `RET.REL` by
+  `make_lepc_cubin.py`) carry the pair for the unit tests, `compare.sh` and `controls.sh`; the
+  controls `lepc_not_adjacent` and `lepc_register_changed` are objected to on it. The
+  independent validator first reported 1,040 "gives a predicate back" problems
   in the newly translated cuDNN functions; they were its own rule counting `RZ` (255) as a
   register of the translation (below).
 - `reference/validate.py` took an `R2P` that restores predicates from `RZ` for one of the

@@ -1070,6 +1070,7 @@ class Function:
                 raise Refused('the translation of the instruction at 0x%x (%s) is not an sm_70 instruction: %032x' % (16 * item.origin, self.src[item.origin].c.name, item.word))
         self.return_addresses()
         self.schedule()
+        self.check_lepc_pairs()
         return self.finish()
 
     def liveness(self):
@@ -1607,9 +1608,11 @@ class Function:
         if name == 'r2ur__noOR' and ops.get('Pu', 7) == 7:
             move = mc.assemble('mov__RRR_RR', Rd=self.R(ops['URd']), Rb=ops['Ra'], **guard)
             return [Item((move & ~(31 << USCHED)) | (w & (31 << USCHED)) | wait, i, 'move')]
-        if name in ('ldg__sImmOffset', 'ld__sImmOffset') and ops.get('sp2') and mc.decode(70, self.put(d.c, w, 'sp2', 0)) is not None:
+        if name in ('ldg__sImmOffset', 'ld__sImmOffset') and ops.get('sp2'):
             # What the load says to the cache about its neighbours: sm_70 has no such thing to say.
-            return [Item(self.put(d.c, w, 'sp2', 0), i, 'without its cache hint')]
+            cleared = self.put(d.c, w, 'sp2', 0)
+            if mc.decode(70, cleared) is not None:
+                return [Item(self.without_batch(name, cleared), i, 'without its cache hint')]
         if name in mc.rule_of:
             out = self.rule(d, mc.rule_of[name], i)
             after = mc.decode(70, out)
@@ -2331,11 +2334,67 @@ class Function:
             moved.append(16 * became[origin][0] + offset % 16)
         return moved
 
+    def without_batch(self, name, word):
+        """`word`, a load the translation changed, with the batch of its original scheduling
+        table cleared: what the translation changed names no batch (its schedule is the
+        translation's). The wait hint of the table (its low five bits) stays."""
+        cls = self.mc.md70.by_name[name]
+        for kind, fields, data in self.mc.d70.plan(cls):
+            if kind == 'table' and data[0] == 'TABLES_opex_0':
+                opex = fields[0].get(word)
+                if opex >> 5:
+                    word = fields[0].put(word, opex & 31)
+                break
+        return word
+
     # ---- return addresses ----------------------------------------------------------------------------------
+    def callee_returns_through_lepc(self, flow, target, register):
+        """Whether every RET the callee can reach is RET.ABS on `register`, adding 0x20 (the
+        call is two instructions after the LEPC), and nothing of the callee writes `register`.
+        A callee that calls others, exits, or has an unreachable RET is not shown to return
+        through it."""
+        src = self.src
+        if not 0 <= target < len(src):
+            return False
+        seen, work, rets = set(), [target], 0
+        while work:
+            i = work.pop()
+            if i in seen:
+                continue
+            seen.add(i)
+            d = src[i]
+            if d.c.name.startswith('call') or d.c.name == 'exit_':
+                return False
+            if d.mnemonic == 'RET':
+                if d.c.name not in ('ret__ABS', 'ret__ABS_UR') or d.ops.get('Ra') != register or d.ops.get('Ra_offset') != 0x20:
+                    return False
+                rets += 1
+                continue
+            if any(l == 'R' and r == register for l, r in d.writes):
+                return False
+            for t in flow.succ[i]:
+                if 0 <= t < len(src):
+                    work.append(t)
+        return rets > 0
+
+    def check_lepc_pairs(self):
+        """The scheduling may put fillers between items: the LEPC and the call it gives the
+        return address of must still be next to each other, or the callee returns into the
+        filler."""
+        for lepc_old, call_old in self.lepc_pairs:
+            lepc = next((i for i, it in enumerate(self.items)
+                         if 16 * it.origin == lepc_old and it.d is not None and it.d.mnemonic == 'LEPC'), None)
+            call = next((i for i, it in enumerate(self.items)
+                         if 16 * it.origin == call_old and it.d is not None and it.d.c.name.startswith('call_rel')), None)
+            if lepc is None or call is None or call != lepc + 1:
+                raise Refused('the LEPC at 0x%x and the call it gives the return address of are not adjacent after scheduling' % lepc_old)
+
     def return_addresses(self):
         """A callee is told where to return by a number: the offset of the instruction after the call,
         put in a register by a MOV before the call. When the code moves, so must that number. The MOV
         is found by what it does, and a function in which it is not found exactly is refused."""
+        self.lepc_pairs = []
+        flow = pairing.Flow(self)
         mc, items = self.mc, self.items
         def immediate(item):
             d = item.d
@@ -2376,27 +2435,27 @@ class Function:
                 if not name.startswith('call_rel'):
                     raise Refused('%s at 0x%x: a jump that is not understood' % (item.d.mnemonic, 16 * item.origin))
                 back = 16 * item.origin + 16
-                # A MOV of the return address before the call is another way back, or the way
-                # when there is no LEPC: it is fixed up with the checks below. A LEPC immediately
-                # before the call no longer hides such a MOV, which would otherwise keep a stale
-                # address once the code moves and send a callee that returns through it to the
-                # wrong place.
+                # The callee decides: when every one of its RETs returns with RET.ABS on the
+                # register of the LEPC immediately before the call, and nothing of it writes
+                # that register, the pair is this call's return address and no MOV of the same
+                # number is one (it may be data). Otherwise the call is an ordinary one:
+                # exactly one MOV of the return address before it, reaching it in a straight
+                # line, is fixed up, as without a LEPC; none or several are refused.
                 linked = k - 1 in lepc_links
-                found = []
-                for j in movs.get(back, []):
-                    if j >= k:
-                        continue    # after the call: not this call's return address
+                pair = (linked and flow.known and item.target is not None
+                        and self.callee_returns_through_lepc(flow, item.target // 16, items[k - 1].d.ops['Rd']))
+                if pair:
+                    self.lepc_pairs.append((16 * items[k - 1].origin, 16 * item.origin))
+                else:
+                    found = [j for j in movs.get(back, [])]
+                    if len(found) != 1 or found[0] > k:
+                        raise Refused('the return address of the call at 0x%x is not given by exactly one MOV' % (16 * item.origin))
+                    j = found[0]
                     register = items[j].d.ops['Rd']
-                    straight = not any(('R', register) in between.d.writes
-                                       or (between.first and 16 * between.origin in self.targets)
-                                       or between.d.kind == 'BRU'
-                                       for between in items[j + 1:k])
-                    if straight:
-                        found.append(j)
-                if len(found) > 1 or (not found and not linked):
-                    raise Refused('the return address of the call at 0x%x is not given by exactly one MOV' % (16 * item.origin))
-                if found:
-                    items[found[0]].fix = back
+                    for between in items[j + 1:k]:
+                        if ('R', register) in between.d.writes or (between.first and 16 * between.origin in self.targets) or between.d.kind == 'BRU':
+                            raise Refused('the return address of the call at 0x%x does not reach it in a straight line' % (16 * item.origin))
+                    items[j].fix = back
             elif name.startswith('call_abs'):
                 # Through a register: the address to return to is the program counter (LEPC) plus the
                 # difference of two numbers, added by the IADD3 that reads the three.

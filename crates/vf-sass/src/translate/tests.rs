@@ -1579,54 +1579,169 @@ fn a_result_of_double_precision_is_read_no_earlier_than_volta_reads_one() {
     assert_eq!(through[0] + through[1], 15, "{through:?}");
 }
 
+/// The words of the tests for a return address from the LEPC before a direct call.
+const LEPC_R128: u128 = 0x008fe40000000000000000000080734e;
+const CALL_TO_NEXT: u128 = 0x000fc200038000000000000000007944;
+const RET_ABS_R128_20: u128 = 0x140fea0003e000000000002080007950;
+const RET_REL: u128 = 0x000fc2000380000000000000ff007950;
+const MOV_R5_30: u128 = 0x000fc20000000f000000003000057802;
+const NOP: u128 = 0x000fc000000000000000000000007918;
+
+fn fd_from_src(words: &[u128]) -> super::parse::FuncData {
+    let mut dec75 = Decoder::new(75);
+    let mut fd = make_borrow_func(&[], 128, &[], &[], false);
+    fd.src = words.iter().map(|&w| dec75.decode(w).expect("decode")).collect();
+    fd
+}
+
+fn same_items(words: &[u128]) -> Vec<Item> {
+    let mut dec75 = Decoder::new(75);
+    words
+        .iter()
+        .enumerate()
+        .map(|(k, &word)| {
+            let mut item = Item::new(word, k, "same", false);
+            item.first = true;
+            item.d = Some(dec75.decode(word).expect("decode"));
+            item
+        })
+        .collect()
+}
+
 /// A direct call's return address can be the program counter read by the LEPC immediately
-/// before it: both move with the code, so no number needs a fixup. cuDNN 9.24's sm_75 code
-/// gives direct calls so (`LEPC R128; CALL.REL`). The pair stays as it was, adjacent.
+/// before it when the callee returns through that register with `RET.ABS` and `0x20`: both
+/// instructions move with the code, so no number needs a fixup. cuDNN 9.24's sm_75 code gives
+/// direct calls so (`LEPC R128; CALL.REL`). The pair stays as it was, adjacent.
 #[test]
 fn a_program_counter_before_a_direct_call_is_its_return_address() {
-    let mut dec75 = Decoder::new(75);
-    // LEPC R128, as cuDNN 9.24's sm_75 code gives it.
-    let lepc = 0x008fe40000000000000000000080734eu128;
-    // CALL.REL 0x760 at origin 1 (the word alone at address 0 prints 0x750): its target is not
-    // followed here, only the return address is.
-    let call = 0x000fea00038000000000074000007944u128;
-    let mut items = vec![Item::new(lepc, 0, "same", false), Item::new(call, 1, "same", false)];
-    for item in &mut items {
-        item.first = true;
-        item.d = Some(dec75.decode(item.word).expect("decode"));
-    }
-    let fd = make_borrow_func(&[(&[], &[]), (&[], &[])], 128, &[], &[], false);
-    let moved = super::return_addr::return_addresses(&mut items, &[], &fd).unwrap();
+    let fd = fd_from_src(&[LEPC_R128, CALL_TO_NEXT, RET_ABS_R128_20]);
+    let mut items = same_items(&[LEPC_R128, CALL_TO_NEXT]);
+    items[1].target = Some(0x20); // the callee is the instruction after the call
+    let (moved, pairs) =
+        super::return_addr::return_addresses(&mut items, &[], &fd).expect("the pair is the return address");
     assert!(moved.is_empty());
-    assert_eq!(items[0].word, lepc);
-    assert_eq!(items[1].word, call);
+    assert_eq!(pairs, vec![(0, 16)]);
+    assert_eq!(items[0].word, LEPC_R128);
+    assert_eq!(items[1].word, CALL_TO_NEXT);
     assert_eq!(items[1].origin, items[0].origin + 1);
     assert_eq!(items[0].fix, None);
 }
 
-/// A MOV of a call's return address before a LEPC and the direct call is fixed up as one is
-/// without the LEPC: the LEPC does not hide it, or a callee that returns through the MOV's
-/// register would go to the old place once the code moves.
+/// A MOV of the same number beside a LEPC whose callee returns through the LEPC's register is
+/// data, not a return address: it is left alone, or the translation would change what a program
+/// computes.
 #[test]
-fn a_mov_return_address_before_a_lepc_and_direct_call_is_fixed_up() {
-    let mut dec75 = Decoder::new(75);
-    // MOV R5, 0x30
-    let mov = 0x000fc20000000f000000003000057802u128;
-    let lepc = 0x008fe40000000000000000000080734eu128;
-    // CALL.REL at origin 2: its return address is 0x30, what the MOV holds.
-    let call = 0x000fea00038000000000074000007944u128;
-    let mut items = vec![
-        Item::new(mov, 0, "same", false),
-        Item::new(lepc, 1, "same", false),
-        Item::new(call, 2, "same", false),
-    ];
-    for item in &mut items {
-        item.first = true;
-        item.d = Some(dec75.decode(item.word).expect("decode"));
-    }
-    let fd = make_borrow_func(&[(&[], &[]), (&[], &[]), (&[], &[])], 128, &[], &[], false);
-    super::return_addr::return_addresses(&mut items, &[], &fd).unwrap();
+fn a_mov_beside_a_lepc_is_left_alone_when_the_callee_returns_through_it() {
+    let fd = fd_from_src(&[MOV_R5_30, LEPC_R128, CALL_TO_NEXT, RET_ABS_R128_20]);
+    let mut items = same_items(&[MOV_R5_30, LEPC_R128, CALL_TO_NEXT]);
+    items[2].target = Some(0x30); // the callee is two instructions after the LEPC
+    let (_, pairs) =
+        super::return_addr::return_addresses(&mut items, &[], &fd).expect("the callee returns through R128");
+    assert_eq!(pairs, vec![(16, 32)]);
+    assert_eq!(items[0].fix, None, "the MOV is data and must not move");
+}
+
+/// When the callee does not return through the LEPC's register, the call is an ordinary one:
+/// the MOV of its return address is fixed up as without a LEPC.
+#[test]
+fn a_mov_beside_a_lepc_is_fixed_up_when_the_callee_does_not_return_through_it() {
+    let fd = fd_from_src(&[MOV_R5_30, LEPC_R128, CALL_TO_NEXT, RET_REL]);
+    let mut items = same_items(&[MOV_R5_30, LEPC_R128, CALL_TO_NEXT]);
+    items[2].target = Some(0x30);
+    let (_, pairs) = super::return_addr::return_addresses(&mut items, &[], &fd).expect("the call is ordinary");
+    assert!(pairs.is_empty());
     assert_eq!(items[0].fix, Some(0x30), "the MOV holds the call's return address");
-    assert_eq!(items[1].word, lepc);
-    assert_eq!(items[2].word, call);
+}
+
+/// Without a MOV, a call whose callee does not return through the LEPC's register is refused:
+/// nothing shows where it returns to.
+#[test]
+fn a_lepc_before_a_call_that_does_not_return_through_it_is_refused() {
+    let fd = fd_from_src(&[LEPC_R128, CALL_TO_NEXT, RET_REL]);
+    let mut items = same_items(&[LEPC_R128, CALL_TO_NEXT]);
+    items[1].target = Some(0x20);
+    assert!(super::return_addr::return_addresses(&mut items, &[], &fd).is_err());
+}
+
+/// A call without a LEPC before it keeps the rule it had: exactly one MOV of its return address
+/// before it. Two (one in each of two ways to the call) are refused, not one fixed and one
+/// left stale.
+#[test]
+fn a_call_with_two_movs_of_its_return_address_is_refused() {
+    let fd = fd_from_src(&[]);
+    let mut items = same_items(&[MOV_R5_30, MOV_R5_30, CALL_TO_NEXT]);
+    assert!(super::return_addr::return_addresses(&mut items, &[], &fd).is_err());
+}
+
+/// The scheduler may put fillers between items: the LEPC and the call it gives the return
+/// address of must still be next to each other, or the callee returns into the filler.
+#[test]
+fn a_lepc_pair_is_refused_when_a_filler_separates_it() {
+    let items = same_items(&[LEPC_R128, CALL_TO_NEXT]);
+    assert!(super::return_addr::lepc_pairs_adjacent(&items, &[(0, 16)]).is_ok());
+    let mut with_filler = same_items(&[LEPC_R128, NOP, CALL_TO_NEXT]);
+    with_filler[1].origin = 0;
+    with_filler[1].what = "fill";
+    assert!(super::return_addr::lepc_pairs_adjacent(&with_filler, &[(0, 16)]).is_err());
+}
+
+/// The checked-in LEPC test kernel (tests/kernels/translate/k_lepc.sm75.cubin, from k_lepc.cu
+/// by make_lepc_cubin.py) has the pair these rules are about: a LEPC immediately before a
+/// direct call, and a RET.ABS of its register adding 0x20.
+#[test]
+fn the_lepc_test_kernel_has_the_pair() {
+    let mut dec75 = Decoder::new(75);
+    let data = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/kernels/translate/k_lepc.sm75.cubin"
+    ));
+    let words: Vec<u128> = data
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .map(|w| u128::from_le_bytes(*w))
+        .collect();
+    let lepc = words
+        .iter()
+        .position(|&w| dec75.decode(w).is_some_and(|d| d.mnemonic == "LEPC"))
+        .expect("a LEPC in the fixture");
+    let call = dec75.decode(words[lepc + 1]).expect("the instruction after the LEPC");
+    assert!(call.name.starts_with("call_rel"), "{}", call.name);
+    let register = dec75.decode(words[lepc]).unwrap().op_or(OP_RD, 255);
+    assert!(
+        words.iter().any(|&w| {
+            dec75.decode(w).is_some_and(|d| {
+                matches!(d.name, "ret__ABS" | "ret__ABS_UR")
+                    && d.op_or(OP_RA, 255) == register
+                    && d.op_or(OP_RA_OFFSET, 0) == 0x20
+            })
+        }),
+        "a RET.ABS of R{register} adding 0x20 in the fixture"
+    );
+}
+
+/// A Turing load rebuilt without its cache hint is an instruction the translation changed: it
+/// must name no batch of the original schedule. The word is cuBLASLt 13's
+/// `@P3 LDG.E.LTC128B.U8.CONSTANT.GPU R64, [R76]` (the batch is 5 there); without the batch
+/// clearing it, the validator says "names another batch than the instruction".
+#[test]
+fn a_rebuilt_turing_load_names_no_batch() {
+    let mut dec75 = Decoder::new(75);
+    let mut dec70 = Decoder::new(70);
+    let word = 0x140ea400001e4120000000004c403381u128;
+    let d = dec75.decode(word).expect("sm_75 LDG");
+    assert_eq!(d.op_or_name("TABLES_Pnz_0(Pnz@not,Pnz)", 0), 0);
+    let cleared = super::util::put_operand(&d, crate::generated::fields::OP_SP2, 0, 75).expect("clear the hint");
+    assert!(dec70.decode(cleared).is_some(), "the hint cleared is sm_70");
+    let mut batch = |w: u128| {
+        dec70
+            .decode(w)
+            .unwrap()
+            .op_or_name("TABLES_opex_0(batch_t,usched_info)", 0)
+            >> 5
+    };
+    assert_eq!(batch(cleared), 5, "the source's batch is still named");
+    let cleaned = super::instruction::without_batch("ldg__sImmOffset", &d, cleared).expect("clear the batch");
+    assert_eq!(batch(cleaned), 0, "a changed instruction names no batch");
+    assert!(dec70.decode(cleaned).is_some());
 }

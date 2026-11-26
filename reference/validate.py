@@ -684,13 +684,13 @@ def register_lives(mc, code, texts75, tables, problems=None, name=''):
                 rets = [decoded[k] for k in body if decoded[k].mnemonic == 'RET']
                 written = any(any(l == 'R' and r == lepc_reg for l, r in decoded[k].writes) for k in body)
                 returns_via_lepc = bool(rets) and not written and all(
-                    r.c.name in ('ret__ABS', 'ret__ABS_UR') and r.ops.get('Ra') == lepc_reg for r in rets)
-                if returns_via_lepc and i in branch_targets:
-                    if problems is not None:
-                        problems.append('%s+0x%x: a branch arrives at a call whose callee returns through R%d, the register of the LEPC before it, so a path skips the LEPC' % (name[:40], 16 * i, lepc_reg))
-                elif not returns_via_lepc and i not in branch_targets:
-                    if problems is not None:
-                        problems.append('%s+0x%x: the call is typed by the LEPC before it, and its callee does not return through R%d with RET.ABS' % (name[:40], 16 * i, lepc_reg))
+                    r.c.name in ('ret__ABS', 'ret__ABS_UR') and r.ops.get('Ra') == lepc_reg
+                    and r.ops.get('Ra_offset') == 0x20 for r in rets)
+                if returns_via_lepc and i in branch_targets and problems is not None:
+                    problems.append('%s+0x%x: a branch arrives at a call whose callee returns through R%d, the register of the LEPC before it, so a path skips the LEPC' % (name[:40], 16 * i, lepc_reg))
+                # When the callee does not return through the LEPC's register, the call is an
+                # ordinary one: its return address is a MOV (the translator's rule), and the
+                # LEPC before it is not this call's. Nothing is wrong with the pair as such.
                 lepc_ok = returns_via_lepc and i not in branch_targets
             # Check exact: all RET.REL name mov_reg (or a copy of it), nothing
             # writes mov_reg, no calls. A RET.REL may name R' where the last write
