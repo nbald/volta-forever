@@ -576,6 +576,7 @@ def register_lives(mc, code, texts75, tables):
     # For exact calls, the RET.REL inside the routine should NOT go to after every call
     # in the section; it should go only to the return address of calls that target it.
     exact_calls, inexact_calls = 0, 0
+    exact_meta, exact_callers = {}, collections.defaultdict(list)
     inexact_reasons = collections.Counter()
     # Branch targets for the exact-call search: instructions entered from elsewhere.
     branch_targets = set()
@@ -932,6 +933,9 @@ def register_lives(mc, code, texts75, tables):
                 callee_writes |= writes_raw[k]
             reads[i] |= callee_live.get(target, 0)
             writes[i] |= callee_writes
+            if exact:
+                exact_meta[target] = (callee_live.get(target, 0), sorted(body))
+                exact_callers[target].append(i)
             # A call kills nothing: the callee may write under a guard, and the caller's
             # value may survive. This is the safe (conservative) direction.
             kills[i] = 0
@@ -990,13 +994,56 @@ def register_lives(mc, code, texts75, tables):
             out |= live_in[t]
         live_out[i] = out
 
+    # Propagate caller-preserved registers/URs back into exact subroutines without feeding back
+    # into callers' own `reads`.
+    exact_body_nodes = set()
+    exact_ret_leaves = {}
+    for target, returns in routine_returns.items():
+        if None in returns or target not in exact_meta:
+            continue
+        _, body = exact_meta[target]
+        exit_mask = 0
+        for c in exact_callers[target]:
+            exit_mask |= live_out[c]
+        for k in body:
+            exact_body_nodes.add(k)
+            if decoded[k].mnemonic == 'RET':
+                exact_ret_leaves[k] = exact_ret_leaves.get(k, 0) | exit_mask
+    if exact_body_nodes:
+        exact_vec = sorted(exact_body_nodes)
+        changed_c = True
+        while changed_c:
+            changed_c = False
+            for k in reversed(exact_vec):
+                out = leaves[k] | exact_ret_leaves.get(k, 0) | (everywhere if k in lost else 0)
+                for t in succ[k]:
+                    out |= live_in[t]
+                new = reads[k] | (out & ~kills[k])
+                if new != live_in[k]:
+                    live_in[k], changed_c = new, True
+        for k in exact_vec:
+            out = leaves[k] | exact_ret_leaves.get(k, 0) | (everywhere if k in lost else 0)
+            for t in succ[k]:
+                out |= live_in[t]
+            live_out[k] = out
+
     # `never`: registers that some instruction writes late without naming a scoreboard.
     never = 0
     for d in decoded:
         if d.kind in ('MIO_FAST', 'MIO_SLOW') and (d.word >> WRITE_BARRIER) & 7 == 7:
             never |= reg_bits(d.writes)
 
-    return live_in, live_out, reads_raw, writes_raw, never, exact_calls, inexact_calls, inexact_reasons
+    hc_call_links = []
+    for target, returns in routine_returns.items():
+        if None in returns or target not in exact_meta:
+            continue
+        live_entry, body = exact_meta[target]
+        for c in exact_callers[target]:
+            hc_call_links.append(('in', c, target, live_entry | (live_in[target] & live_out[c])))
+            for k in body:
+                hc_call_links.append(('out', c, k, writes_raw[k]))
+
+    return live_in, live_out, reads_raw, writes_raw, never, exact_calls, inexact_calls, inexact_reasons, succ, hc_call_links
 
 
 def predicate_lives(mc, code, texts75, tables):
@@ -1949,7 +1996,7 @@ def waited_after(code, at, board):
     return False, at
 
 
-def schedule(mc, code, highest, sequences=frozenset(), borrowed=frozenset(), added=frozenset()):
+def schedule(mc, code, highest, sequences=frozenset(), borrowed=frozenset(), added=frozenset(), immediate_reads=frozenset()):
     """What does not hold of the schedule of the translated `code` of a function whose original uses
     registers up to `highest`: (offset, what) for each, and how many late readers were looked at.
     `sequences`: the offsets of the instructions that stand for matrix instructions, whose late
@@ -1981,7 +2028,7 @@ def schedule(mc, code, highest, sequences=frozenset(), borrowed=frozenset(), add
         # without the wait, unseen; the control `nowait` changed two Triton cubins so and was
         # objected to in neither. Not the rule below, the next instruction waiting: the homes of
         # uniform registers are read late and written again only much later.)
-        if d is not None and d.kind in machine.LATE and 16 * k in added and not any(
+        if d is not None and d.kind in machine.LATE and 16 * k in added and 16 * k not in immediate_reads and not any(
                 letter == 'R' and register > highest for letter, register, role in d.reads):
             mine = {register for letter, register, role in d.reads if letter == 'R' and register in borrowed}
             boards = {sb for sb in ((w >> WRITE_BARRIER) & 7, (w >> READ_BARRIER) & 7) if sb != 7}
@@ -1996,8 +2043,8 @@ def schedule(mc, code, highest, sequences=frozenset(), borrowed=frozenset(), add
                     late += 1
                     out.append((16 * k, 'reads late a register that the translation borrows, and the instruction at 0x%x writes it before a wait until it has read' % (16 * j)))
                     break
-        if d is not None and d.kind in machine.LATE and any(
-                letter == 'R' and register > highest for letter, register, role in d.reads):
+        if d is not None and d.kind in machine.LATE and (
+                16 * k in immediate_reads or any(letter == 'R' and register > highest for letter, register, role in d.reads)):
             late += 1
             # (Instructions that do nothing and do not wait may come between, where the schedule
             # needed more time than a stall count holds.)
@@ -2318,7 +2365,7 @@ def check_frame_slots(slots, frame_bytes, name, problems):
                     name[:40], u, u))
 
 
-def frame_completeness(mc, old, original_code, slots, loads, stores, at, say):
+def frame_completeness(mc, old, original_code, slots, loads, stores, at, say, homed_urs=()):
     """Rule B4, completeness. Every uniform register of the frame (`slots`) that the original
     instruction at `old` READS is loaded (`loads`); every one it WRITES is stored (`stores`).
     Where the original is under a guard, what it writes is loaded too: the store after it, under
@@ -2335,13 +2382,13 @@ def frame_completeness(mc, old, original_code, slots, loads, stores, at, say):
                 if letter == 'U' and operand in d75.ops and d75.ops[operand] != 63:
                     u, count = d75.ops[operand], machine.registers(span, d75.ops)
                     for k in range(count):
-                        if u + k in slots:
+                        if u + k in slots and u + k not in homed_urs:
                             read_urs.add(u + k)
             for letter, operand, span in uses.writes:
                 if letter == 'U' and operand in d75.ops and d75.ops[operand] != 63:
                     u, count = d75.ops[operand], machine.registers(span, d75.ops)
                     for k in range(count):
-                        if u + k in slots:
+                        if u + k in slots and u + k not in homed_urs:
                             written_urs.add(u + k)
             loaded_urs = {int(re.match(r'mem: load UR(\d+)$', w).group(1)) for new, w in loads if re.match(r'mem: load UR(\d+)$', w)}
             stored_urs = {int(re.match(r'mem: store UR(\d+)$', w).group(1)) for new, w in stores if re.match(r'mem: store UR(\d+)$', w)}
@@ -2358,7 +2405,7 @@ def frame_completeness(mc, old, original_code, slots, loads, stores, at, say):
 def check_frame_sequence(mc, name, old, parts, tb, ta, result_code, original_code,
                          slots, frame_bytes, highest, place, by_origin, listing,
                          problems, kinds, pool, borrowed_regs, borrow_pools_declared,
-                         reg_lives, sequences, say, r1_depths=None):
+                         reg_lives, sequences, say, r1_depths=None, homes_at=None):
     """Rules B and C for one original instruction that has mem: instructions around it.
     Returns (core_parts, mem_standins) where core_parts is what remains after stripping
     mem: instructions, and mem_standins is {uniform_register: ordinary_register} for this
@@ -2515,7 +2562,8 @@ def check_frame_sequence(mc, name, old, parts, tb, ta, result_code, original_cod
                 say(where, old, 'mem: store', 'B3: the next instruction does not wait for the store\'s read scoreboard %d' % rb_sb)
 
     # B4: completeness (`frame_completeness`).
-    frame_completeness(mc, old, original_code, slots, loads, stores, parts[0][0], say)
+    homed_urs = set(homes_at[old].values()) if homes_at else ()
+    frame_completeness(mc, old, original_code, slots, loads, stores, parts[0][0], say, homed_urs)
 
     # R1 lowering is handled separately.
     for new, w in r1_lower:
@@ -3407,6 +3455,27 @@ def main():
         # an instruction and written down after one, {old offset: [(register, predicate)]}; the
         # registers that hold.
         backs, downs, holders = collections.defaultdict(list), collections.defaultdict(list), set()
+        homes_by_ur_old = {}
+        home_at_u = collections.defaultdict(dict)
+        home_dup_problems = []
+        for u, r, offsets in borrow_homes.get(name, []):
+            for at in offsets:
+                prev = homes_by_ur_old.get((u, at))
+                if prev is not None and prev != r:
+                    home_dup_problems.append('%s+0x%x: HL: UR%d has conflicting homes R%d and R%d at 0x%x' % (name[:40], at, u, prev, r, at))
+                homes_by_ur_old[(u, at)] = r
+                home_at_u[u][at] = r
+        mem_standins = {}
+        def stands_ur(u_str, r_str, old_off, allow_write_slot=True):
+            un = int(u_str[2:])
+            rn = int(r_str[1:]) if r_str.startswith('R') and r_str != 'RZ' else -1
+            if (un, old_off) in homes_by_ur_old:
+                return rn >= 0 and (rn > highest or rn >= 2) and rn == homes_by_ur_old[(un, old_off)]
+            if un in mem_standins:
+                return r_str == mem_standins[un]
+            if un in frame_slots:
+                return allow_write_slot
+            return place.setdefault(u_str, r_str) == r_str
         def stands_for(u, r, old):
             """The ordinary predicate `r` (P3) stands for the uniform one `u` (UP1) at `old`."""
             return ups.setdefault((int(u[2:]), old), int(r[1:])) == int(r[1:])
@@ -3782,13 +3851,13 @@ def main():
             if frame_slots and parts and not any(is_mem(w) for _, w in parts):
                 # (Nothing moves the frame around the instruction: it reads and writes no uniform
                 # register of the frame, rule B4.)
-                frame_completeness(mc, old, original_code, frame_slots, [], [], parts[0][0], say)
+                frame_completeness(mc, old, original_code, frame_slots, [], [], parts[0][0], say, set(homes_at[old].values()))
             if any(is_mem(w) for _, w in parts):
                 result_core, mem_standins = check_frame_sequence(
                     mc, name, old, parts, tb, ta, result_code, original_code,
                     frame_slots, frame_bytes, highest, place, by_origin, listing,
                     problems, kinds, pool, borrowed_regs, borrow_pools.get(name, []),
-                    reg_lives, sequences, say, r1_depths=r1_depths)
+                    reg_lives, sequences, say, r1_depths=r1_depths, homes_at=homes_at)
                 if result_core is None:
                     continue
                 # Rule A3: check R1 lowering at offset 0.
@@ -3865,7 +3934,7 @@ def main():
                     candidates = added - made - known
                     stand = next(iter(candidates)) if len(candidates) == 1 else None
                     stand_r = int(stand[1:]) if stand is not None else -1
-                    ok = stand is not None and place.setdefault(under.group(1), stand) == stand and (stand_r > highest or stand_r >= 2)
+                    ok = stand is not None and stands_ur(under.group(1), stand, old) and (stand_r > highest or stand_r >= 2)
                     if ok and stand_r <= highest:
                         borrowed_regs.add(stand_r)
                     why = 'the uniform part of its address is not added once from the register that stands for it'
@@ -3950,14 +4019,7 @@ def main():
                     if u.startswith('UR') and u != 'URZ':
                         un = int(u[2:])
                         rn = int(r[1:]) if r[0] == 'R' and r != 'RZ' else -1
-                        if un in mem_standins:
-                            # Level 3: the stand-in is per-instruction, loaded from memory.
-                            ok = ok and rn >= 0 and r == mem_standins[un] and (rn > highest or rn >= 2)
-                        elif un in frame_slots:
-                            # Level 3: a UR in the frame but not loaded (it is being written).
-                            ok = ok and rn >= 0 and (rn > highest or rn >= 2)
-                        else:
-                            ok = ok and rn >= 0 and place.setdefault(u, r) == r and (rn > highest or rn >= 2)
+                        ok = ok and rn >= 0 and stands_ur(u, r, old) and (rn > highest or rn >= 2)
                         if ok and rn >= 0:
                             got_ur[un] = rn
                         if ok and rn <= highest and rn >= 2:
@@ -3983,12 +4045,7 @@ def main():
                             if not ok:
                                 break
                             r_hi = 'R%d' % (rn + 1)
-                            if un + 1 in mem_standins:
-                                ok = ok and mem_standins[un + 1] == r_hi and (rn + 1 > highest or rn + 1 >= 2)
-                            elif un + 1 in frame_slots:
-                                ok = ok and (rn + 1 > highest or rn + 1 >= 2)
-                            else:
-                                ok = ok and place.setdefault('UR%d' % (un + 1), r_hi) == r_hi and (rn + 1 > highest or rn + 1 >= 2)
+                            ok = ok and stands_ur('UR%d' % (un + 1), r_hi, old) and (rn + 1 > highest or rn + 1 >= 2)
                             if ok and rn + 1 <= highest and rn + 1 >= 2:
                                 borrowed_regs.add(rn + 1)
                 # Everything but the registers: the same once the uniform mnemonic and names are made ordinary.
@@ -4014,9 +4071,7 @@ def main():
                         if not x.startswith('UR'):
                             return x == y
                         un = int(x[2:])
-                        if un in mem_standins:
-                            return y == mem_standins[un]
-                        return un not in frame_slots and place.setdefault(x, y) == y
+                        return stands_ur(x, y, old, allow_write_slot=False)
                     ok = REG.sub('#', m.group(4)) == REG.sub('#', p.group(4)) and all(stands(x, y) for x, y in zip(rest_a, rest_b))
                 if not ok:
                     say(new, old, 'upper half of a product', 'not IMAD.WIDE into two new registers then MOV of the upper one')
@@ -4054,11 +4109,7 @@ def main():
                         if not x.startswith('UR'):
                             return x == y
                         un = int(x[2:])
-                        if un in mem_standins:
-                            return y == mem_standins[un]
-                        if un in frame_slots:
-                            return True
-                        return place.setdefault(x, y) == y
+                        return stands_ur(x, y, old)
                     for operands in (p.group(3), q.group(3)):
                         ok = ok and REG.sub('#', m.group(4)) == REG.sub('#', operands) and all(ur_matches(x, y) for x, y in zip(REG.findall(m.group(4)), REG.findall(operands)))
                 if not ok:
@@ -4094,10 +4145,7 @@ def main():
                     mine = {n: r for n, r in bound.items() if n not in given and not n.startswith('UR')}
                     ok = len(set(mine.values())) == len(mine) and not set(mine.values()) & set(given.values()) and all(int(r[1:]) > highest or int(r[1:]) >= 2 for r in mine.values())
                     # Level 3 with mem_standins: UR bindings are per-instruction, not function-wide.
-                    if mem_standins:
-                        ok = ok and all(r == given.get(n, r) for n, r in bound.items() if n.startswith('UR'))
-                    else:
-                        ok = ok and all(place.setdefault(n, r) == r for n, r in bound.items() if n.startswith('UR'))
+                    ok = ok and all(stands_ur(n, r, old) for n, r in bound.items() if n.startswith('UR'))
                     # Level 3: borrowed registers for the matrix sequence.
                     for r in mine.values():
                         rn = int(r[1:])
@@ -4188,15 +4236,7 @@ def main():
                     const_r = int(p.group(2)[1:]) if p else -1
                     ok = ok and bool(p) and guarded(m.group(1), p.group(1), old) and p.group(3) == m.group(4) and int(p.group(4), 16) & 0xffff == (int(m.group(5), 16) + 4 * half) & 0xffff and (const_r > highest or const_r >= 2)
                     if ok:
-                        if un in mem_standins:
-                            # Level 3: the register is the per-instruction stand-in loaded from memory.
-                            ok = ok and p.group(2) == mem_standins[un]
-                        elif un in frame_slots:
-                            # Level 3: a UR in the frame, but not loaded (it is being written).
-                            # The register is per-instruction; do not register in function-wide `place`.
-                            pass
-                        else:
-                            ok = ok and place.setdefault(u, p.group(2)) == p.group(2)
+                        ok = ok and stands_ur(u, p.group(2), old)
                     if ok and const_r <= highest:
                         borrowed_regs.add(const_r)
                 if not ok:
@@ -4214,11 +4254,8 @@ def main():
                     if u == 'URZ' and r == 'RZ':
                         return True
                     un = int(u[2:]) if u.startswith('UR') else -1
-                    if un >= 0 and un in mem_standins:
-                        return rn >= 0 and r == mem_standins[un] and (rn > highest or rn >= 2)
-                    if un >= 0 and un in frame_slots:
-                        # Level 3: a UR in the frame, per-instruction register.
-                        if rn < 0 or (rn <= highest and rn < 2):
+                    if un >= 0 and (un in mem_standins or un in frame_slots or (un, old) in homes_by_ur_old):
+                        if not stands_ur(u, r, old) or rn < 0 or (rn <= highest and rn < 2):
                             return False
                         if rn <= highest:
                             borrowed_regs.add(rn)
@@ -4270,12 +4307,7 @@ def main():
                     p = re.match(r'(@!?P\d )?MOV (R\d+), c\[(0x[0-9a-f]+)\]\[(-?0x[0-9a-f]+)\]$', got[0])
                     small_r = int(p.group(2)[1:]) if p else -1
                     un_small = int(m.group(4)[2:])
-                    if un_small in mem_standins:
-                        ok = bool(p) and guarded(m.group(1), p.group(1), old) and p.group(3) == m.group(5) and int(p.group(4), 16) & 0xffff == address - address % 4 and p.group(2) == mem_standins[un_small] and (small_r > highest or small_r >= 2)
-                    elif un_small in frame_slots:
-                        ok = bool(p) and guarded(m.group(1), p.group(1), old) and p.group(3) == m.group(5) and int(p.group(4), 16) & 0xffff == address - address % 4 and (small_r > highest or small_r >= 2)
-                    else:
-                        ok = bool(p) and guarded(m.group(1), p.group(1), old) and p.group(3) == m.group(5) and int(p.group(4), 16) & 0xffff == address - address % 4 and place.setdefault(m.group(4), p.group(2)) == p.group(2) and (small_r > highest or small_r >= 2)
+                    ok = bool(p) and guarded(m.group(1), p.group(1), old) and p.group(3) == m.group(5) and int(p.group(4), 16) & 0xffff == address - address % 4 and stands_ur(m.group(4), p.group(2), old) and (small_r > highest or small_r >= 2)
                     if ok and small_r <= highest:
                         borrowed_regs.add(small_r)
                     if ok:
@@ -4301,11 +4333,7 @@ def main():
                     def check_pair(u, r):
                         un = int(u[2:])
                         rn = int(r[1:])
-                        if un in mem_standins:
-                            return r == mem_standins[un] and (rn > highest or rn >= 2)
-                        if un in frame_slots:
-                            return rn > highest or rn >= 2
-                        return place.setdefault(u, r) == r and (rn > highest or rn >= 2)
+                        return stands_ur(u, r, old) and (rn > highest or rn >= 2)
                     ok = all(check_pair(u, r) for u, r in pairs)
                     ok = ok and (m.group(3) is None) == (q.group(3) is None) and (m.group(3) is None or stands_for(m.group(3), q.group(3), old))
                 if not ok:
@@ -4316,12 +4344,7 @@ def main():
                 move_r = int(p.group(2)[1:]) if p else -1
                 move_un = int(m.group(2)[2:]) if m else -1
                 if m and p and m.group(1) == p.group(1) and m.group(3) == p.group(3) and (move_r > highest or move_r >= 2):
-                    if move_un in mem_standins:
-                        ok_move = p.group(2) == mem_standins[move_un]
-                    elif move_un in frame_slots:
-                        ok_move = True
-                    else:
-                        ok_move = place.setdefault(m.group(2), p.group(2)) == p.group(2)
+                    ok_move = stands_ur(m.group(2), p.group(2), old)
                 else:
                     ok_move = False
                 if not ok_move:
@@ -4422,11 +4445,12 @@ def main():
         # what makes that right. (Until 2026-11-20 two homes in one register above the
         # program's were objected to whatever their lives.)
         declared_pairs = {('UR%d' % u, 'R%d' % r) for u, r, offsets in borrow_homes.get(name, [])}
+        declared_home_regs = {r for u, r in declared_pairs}
         whole = {u: r for u, r in registers.items() if (u, r) not in declared_pairs}
         above_regs = {u: r for u, r in whole.items() if int(r[1:]) > highest}
         if len(set(above_regs.values())) != len(above_regs):
             problems.append('%s: two uniform registers share an ordinary one above highest: %s' % (name[:40], above_regs))
-        both = sorted(set(whole.values()) & {r for u, r in declared_pairs})
+        both = sorted(set(whole.values()) & declared_home_regs)
         if both:
             problems.append('%s: a register stands for a uniform one in the whole function and is the home of another for a declared life: %s' % (name[:40], both))
         # (Rule V1, for the registers that the translator declares no life of.)
@@ -4448,7 +4472,7 @@ def main():
         # product, a Triton tl.dot in float32 whose epilogue loads with LDSM and names 252
         # registers, was objected to here for that alone.)
         if frame_bytes == 0 and not has_level3_products:
-            if ((scratch - borrowed_by_loads) | apart | row_registers) & (set(registers.values()) | pool | savers) or apart & scratch or row_registers & (scratch | apart):
+            if ((scratch - borrowed_by_loads) | apart | row_registers) & (set(registers.values()) | declared_home_regs | pool | savers) or apart & scratch or row_registers & (scratch | apart):
                 problems.append('%s: a register of the matrix sequences, the lane, what is kept of it or a row is used for something else too' % name[:40])
         if row_loads or halves or conversions:
             code = result.section('.text.' + name).data
@@ -4972,7 +4996,8 @@ def main():
                     problems.append('%s (from 0x%x): U: R%d is declared put away at this instruction, and nothing of its sequence puts it away' % (name[:40], at, r))
         # ---- schedule check (deferred from above: needs borrowed_regs) ----
         wrong, late = schedule(mc, result_code, highest, sequences, borrowed_regs,
-                               {new70 for new70, old75, what in listing if what != 'same'})
+                               {new70 for new70, old75, what in listing if what != 'same'},
+                               {new70 for new70, old75, what in listing if what in ('on the sum', 'on the uniform part', 'on the product')})
         kinds['(schedule) instructions that read late a register of the translation'] += late
         for at, what in wrong:
             problems.append('%s+0x%x: %s: %s' % (name[:40], at, what, tb[at // 16]))
@@ -5026,7 +5051,7 @@ def main():
             if not is_entry:
                 problems.append('%s: registers are borrowed in a function that is not a kernel entry' % name[:40])
             if reg_lives is not None:
-                rl_in, rl_out, rl_reads, rl_writes, rl_never, rl_exact, rl_inexact, rl_reasons = reg_lives
+                rl_in, rl_out, rl_reads, rl_writes, rl_never, rl_exact, rl_inexact, rl_reasons, rl_succ, rl_hc_calls = reg_lives
                 kinds['(borrow) exact calls'] += rl_exact
                 kinds['(borrow) inexact calls'] += rl_inexact
                 for reason, count in rl_reasons.items():
@@ -5060,18 +5085,42 @@ def main():
                 # it. And its homes are one register. (Until 2026-11-20 the declared life was
                 # taken on trust: homes declared at fewer instructions than the value lives
                 # passed, and with them whatever was computed into the register meanwhile.)
-                home_of, home_life = {}, collections.defaultdict(set)
-                for u, r, offsets in homes_declared:
-                    if home_of.setdefault(u, r) != r:
-                        problems.append('%s: HL: UR%d has two homes, R%d and R%d' % (name[:40], u, home_of[u], r))
-                    home_life[u].update(offsets)
-                for u in sorted(home_of):
-                    bit = 1 << (256 + u)
-                    for i in range(n75):
-                        if (rl_in[i] | rl_out[i] | rl_reads[i] | rl_writes[i]) & bit and 16 * i not in home_life[u]:
-                            problems.append('%s+0x%x: HL: UR%d holds something there, or is read or written there, and its home R%d is not declared there' % (name[:40], 16 * i, u, home_of[u]))
-                            break
-                kinds['(borrow) homes whose declared life is the whole life of the uniform register'] += len(home_of)
+                problems.extend(home_dup_problems)
+                for u, at_map in sorted(home_at_u.items()):
+                    if 'UR%d' % u not in registers and u not in frame_slots:
+                        bit = 1 << (256 + u)
+                        for i in range(n75):
+                            if (rl_in[i] | rl_out[i] | rl_reads[i] | rl_writes[i]) & bit and 16 * i not in at_map:
+                                r_rep = next(iter(at_map.values()))
+                                problems.append('%s+0x%x: HL: UR%d holds something there, or is read or written there, and its home R%d is not declared there' % (name[:40], 16 * i, u, r_rep))
+                                break
+                # HC: every value-flow edge along which URu is live preserves the same home (or none).
+                hc_bad = set()
+                for i in range(n75):
+                    for t in rl_succ[i]:
+                        for u, at_map in home_at_u.items():
+                            if u not in hc_bad and (rl_in[t] >> (256 + u)) & 1:
+                                ra, rb = at_map.get(16 * i), at_map.get(16 * t)
+                                if ra != rb:
+                                    hc_bad.add(u)
+                                    problems.append('%s+0x%x: HC: UR%d changes home across flow to 0x%x (%s vs %s)' % (name[:40], 16 * i, u, 16 * t, ra, rb))
+                for kind_l, c, other, mask in rl_hc_calls:
+                    for u, at_map in home_at_u.items():
+                        if u in hc_bad:
+                            continue
+                        if kind_l == 'in':
+                            if (mask >> (256 + u)) & 1:
+                                ra, rb = at_map.get(16 * c), at_map.get(16 * other)
+                                if ra != rb:
+                                    hc_bad.add(u)
+                                    problems.append('%s+0x%x: HC: UR%d changes home across call to 0x%x (%s vs %s)' % (name[:40], 16 * c, u, 16 * other, ra, rb))
+                        else:
+                            if ((mask & rl_out[c]) >> (256 + u)) & 1:
+                                ra, rb = at_map.get(16 * other), at_map.get(16 * c)
+                                if ra != rb:
+                                    hc_bad.add(u)
+                                    problems.append('%s+0x%x: HC: UR%d changes home across return to 0x%x (%s vs %s)' % (name[:40], 16 * other, u, 16 * c, ra, rb))
+                kinds['(borrow) homes whose declared life is the whole life of the uniform register'] += len(home_at_u)
                 # H1: a register of the program that holds a uniform predicate between the
                 # instructions that name it holds nothing of the program all along that life.
                 for q, register, offsets in helds.get(name, []):
@@ -5168,6 +5217,7 @@ def main():
                 # R3b: for each instruction that has a pool or home declaration, the first
                 # instruction of its sequence waits for every scoreboard any instruction of
                 # the function names for a write into, or a late read of, that register.
+                what_at_off = {n: what for n, _, what in listing}
                 boards_of = {}         # {register: set of scoreboards}
                 for k, w in enumerate(words70):
                     d70 = mc.decode(70, w)
@@ -5178,9 +5228,19 @@ def main():
                     for l, r in d70.writes:
                         if l == 'R' and r in B and wb != 7:
                             boards_of.setdefault(r, set()).add(wb)
-                    for l, r, *_ in d70.reads:
-                        if l == 'R' and r in B and rb != 7:
-                            boards_of.setdefault(r, set()).add(rb)
+                    what_k = what_at_off.get(16 * k)
+                    immediate_late = (
+                        what_k is not None
+                        and what_k != 'same'
+                        and d70.kind != 'BRU'
+                        and rb != 7
+                        and waited_after(result_code, 16 * k, rb)[0]
+                        and (what_k in ('on the sum', 'on the uniform part', 'on the product', 'ordinary registers') or is_mem(what_k) or is_room(what_k))
+                    )
+                    if rb != 7 and not immediate_late:
+                        for l, r, *_ in d70.reads:
+                            if l == 'R' and r in B:
+                                boards_of.setdefault(r, set()).add(rb)
                 borrows_at_old = {}       # {sm_75 offset: set of borrowed registers}
                 for u, r, offsets in homes_declared:
                     for at in offsets:

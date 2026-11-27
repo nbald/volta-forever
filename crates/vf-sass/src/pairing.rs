@@ -6,8 +6,9 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use crate::decode::{Decoded, LETTER_P, LETTER_R};
+use crate::decode::{Decoded, Kind, LETTER_P, LETTER_R};
 use crate::field;
+use crate::generated::fields::{OP_COND, OP_PG, OP_PG_AT_NOT, OP_PP, OP_PP_AT_NOT, OP_UPG, OP_UPG_AT_NOT};
 
 const LOADS: &[&str] = &["ldsm__sImmOffset", "ldsm__URsIR"];
 const PRODUCT: &str = "hmma_x8_";
@@ -136,8 +137,30 @@ impl Plan {
 
 // ---- Helpers ----
 
-fn true_guard(d: &Decoded, name: &str) -> bool {
-    d.op_or_name(name, 7) == 7 && d.op_or_name(&format!("{name}@not"), 0) == 0
+#[inline]
+fn true_upg(d: &Decoded) -> bool {
+    for &(k, v) in &d.ops {
+        if k == OP_UPG && v != 7 {
+            return false;
+        }
+        if k == OP_UPG_AT_NOT && v != 0 {
+            return false;
+        }
+    }
+    true
+}
+
+#[inline]
+fn true_pp(d: &Decoded) -> bool {
+    for &(k, v) in &d.ops {
+        if k == OP_PP && v != 7 {
+            return false;
+        }
+        if k == OP_PP_AT_NOT && v != 0 {
+            return false;
+        }
+    }
+    true
 }
 
 /// The predicates an instruction may write: those its operands say, and for R2P those of its
@@ -161,8 +184,17 @@ fn written_predicates(d: &Decoded) -> BTreeSet<u32> {
     out
 }
 
+#[inline]
 pub(crate) fn unguarded(d: &Decoded) -> bool {
-    true_guard(d, "Pg") && true_guard(d, "UPg")
+    for &(k, v) in &d.ops {
+        if (k == OP_PG || k == OP_UPG) && v != 7 {
+            return false;
+        }
+        if (k == OP_PG_AT_NOT || k == OP_UPG_AT_NOT) && v != 0 {
+            return false;
+        }
+    }
+    true
 }
 
 /// Whether instruction `d` always goes on to the next instruction and does not leave the
@@ -277,18 +309,7 @@ impl Flow {
             return Self::empty(n, kind, entered);
         }
 
-        let named: Vec<Option<usize>> = (0..n)
-            .map(|i| {
-                let (rel_fid, scale) = crate::translate::find_relative_decoded(&src[i], 75)?;
-                let v = field::signed(rel_fid, src[i].word);
-                let t = 16 * i as i64 + 16 + v * scale as i64;
-                if t % 16 == 0 && t >= 0 && t < 16 * n as i64 {
-                    Some((t / 16) as usize)
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let named = Self::compute_named(src);
 
         let meets: Vec<usize> = {
             let mut s: BTreeSet<usize> = BTreeSet::new();
@@ -359,80 +380,9 @@ impl Flow {
             }
         }
 
-        // What a call reads and writes.
-        let mut called: HashMap<usize, CallEffect> = HashMap::new();
-        for i in 0..n {
-            if kind[i] != "call" {
-                continue;
-            }
-            if !src[i].name.starts_with("call_rel") || named[i].is_none() {
-                called.insert(i, None);
-                continue;
-            }
-            let entry = named[i].unwrap();
-            let mut body = BTreeSet::new();
-            let mut work = vec![entry];
-            let mut simple = true;
-            while let Some(k) = work.pop() {
-                if body.contains(&k) {
-                    continue;
-                }
-                body.insert(k);
-                if kind[k] == "call" {
-                    simple = false;
-                    break;
-                }
-                work.extend(succ[k].iter().copied());
-            }
-            if !simple {
-                called.insert(i, None);
-                continue;
-            }
-            let mut alive: BTreeMap<usize, BTreeSet<u32>> = body.iter().map(|&k| (k, BTreeSet::new())).collect();
-            let mut changed = true;
-            while changed {
-                changed = false;
-                for &k in body.iter().rev() {
-                    let mut after_set = BTreeSet::new();
-                    for &t in &succ[k] {
-                        if let Some(a) = alive.get(&t) {
-                            after_set.extend(a.iter().copied());
-                        }
-                    }
-                    let kills: BTreeSet<u32> = if unguarded(&src[k]) {
-                        src[k]
-                            .writes
-                            .iter()
-                            .filter(|&&(l, _)| l == LETTER_R)
-                            .map(|&(_, x)| x)
-                            .collect()
-                    } else {
-                        BTreeSet::new()
-                    };
-                    let reads: BTreeSet<u32> = src[k]
-                        .reads
-                        .iter()
-                        .filter(|&&(l, _, _)| l == LETTER_R)
-                        .map(|&(_, x, _)| x)
-                        .collect();
-                    let mut now = reads;
-                    for x in after_set {
-                        if !kills.contains(&x) {
-                            now.insert(x);
-                        }
-                    }
-                    if now != alive[&k] {
-                        alive.insert(k, now);
-                        changed = true;
-                    }
-                }
-            }
-            let writes: BTreeSet<u32> = body
-                .iter()
-                .flat_map(|&k| src[k].writes.iter().filter(|&&(l, _)| l == LETTER_R).map(|&(_, x)| x))
-                .collect();
-            called.insert(i, Some((alive[&entry].clone(), writes)));
-        }
+        let called = Self::compute_call_effects(src, |i| kind[i] == "call", &named, &mut |k, out| {
+            out.extend(succ[k].iter().copied());
+        });
 
         let aligned: Vec<bool> = (0..n)
             .map(|i| (LOADS.contains(&src[i].name) || src[i].name == PRODUCT) && unguarded(&src[i]))
@@ -473,12 +423,120 @@ impl Flow {
         }
     }
 
+    fn compute_named(src: &[Decoded]) -> Vec<Option<usize>> {
+        let n = src.len();
+        (0..n)
+            .map(|i| {
+                if !matches!(src[i].mnemonic, "BRA" | "CALL" | "BSSY" | "PBK" | "SSY" | "PCNT")
+                    && src[i].kind != Kind::BRU
+                {
+                    return None;
+                }
+                let (rel_fid, scale) = crate::translate::find_relative_decoded(&src[i], 75)?;
+                let v = field::signed(rel_fid, src[i].word);
+                let t = 16 * i as i64 + 16 + v * scale as i64;
+                if t % 16 == 0 && t >= 0 && t < 16 * n as i64 {
+                    Some((t / 16) as usize)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn compute_call_effects(
+        src: &[Decoded],
+        is_call: impl Fn(usize) -> bool,
+        named: &[Option<usize>],
+        push_succ: &mut dyn FnMut(usize, &mut Vec<usize>),
+    ) -> HashMap<usize, CallEffect> {
+        let n = src.len();
+        let mut called: HashMap<usize, CallEffect> = HashMap::new();
+        let mut tmp_succ: Vec<usize> = Vec::new();
+        for i in 0..n {
+            if !is_call(i) {
+                continue;
+            }
+            if !src[i].name.starts_with("call_rel") || named[i].is_none() {
+                called.insert(i, None);
+                continue;
+            }
+            let entry = named[i].unwrap();
+            let mut body = BTreeSet::new();
+            let mut work = vec![entry];
+            let mut simple = true;
+            while let Some(k) = work.pop() {
+                if !body.insert(k) {
+                    continue;
+                }
+                if is_call(k) {
+                    simple = false;
+                    break;
+                }
+                tmp_succ.clear();
+                push_succ(k, &mut tmp_succ);
+                work.extend(tmp_succ.iter().copied());
+            }
+            if !simple {
+                called.insert(i, None);
+                continue;
+            }
+            let mut alive: BTreeMap<usize, BTreeSet<u32>> = body.iter().map(|&k| (k, BTreeSet::new())).collect();
+            let mut changed = true;
+            while changed {
+                changed = false;
+                for &k in body.iter().rev() {
+                    let mut after_set = BTreeSet::new();
+                    tmp_succ.clear();
+                    push_succ(k, &mut tmp_succ);
+                    for &t in &tmp_succ {
+                        if let Some(a) = alive.get(&t) {
+                            after_set.extend(a.iter().copied());
+                        }
+                    }
+                    let kills: BTreeSet<u32> = if unguarded(&src[k]) {
+                        src[k]
+                            .writes
+                            .iter()
+                            .filter(|&&(l, _)| l == LETTER_R)
+                            .map(|&(_, x)| x)
+                            .collect()
+                    } else {
+                        BTreeSet::new()
+                    };
+                    let reads: BTreeSet<u32> = src[k]
+                        .reads
+                        .iter()
+                        .filter(|&&(l, _, _)| l == LETTER_R)
+                        .map(|&(_, x, _)| x)
+                        .collect();
+                    let mut now = reads;
+                    for x in after_set {
+                        if !kills.contains(&x) {
+                            now.insert(x);
+                        }
+                    }
+                    if now != alive[&k] {
+                        alive.insert(k, now);
+                        changed = true;
+                    }
+                }
+            }
+            let writes: BTreeSet<u32> = body
+                .iter()
+                .flat_map(|&k| src[k].writes.iter().filter(|&&(l, _)| l == LETTER_R).map(|&(_, x)| x))
+                .collect();
+            called.insert(i, Some((alive[&entry].clone(), writes)));
+        }
+        called
+    }
+
     fn kind_of(src: &[Decoded], tables: &[(u64, Vec<u64>)], i: usize) -> &'static str {
         let d = &src[i];
         let m = d.mnemonic;
         if m == "BRA" {
             // BRA.U (cond=1) is taken always when it is under no predicate. BRA.DIV and BRA.CONV stay conditional.
-            return if unguarded(d) && true_guard(d, "Pp") && matches!(d.op_or_name("cond", 0), 0 | 1) {
+            return if unguarded(d) && true_pp(d) && matches!(d.op_or(OP_COND, 0), 0 | 1) {
                 "jump"
             } else {
                 "cond"
@@ -634,7 +692,7 @@ impl Flow {
                 // Guard analysis
                 let guard: Option<Option<(u32, u32)>> = if unguarded(d) {
                     None // no guard
-                } else if !d.has_op_name("UPg") || true_guard(d, "UPg") {
+                } else if !d.has_op_name("UPg") || true_upg(d) {
                     Some(Some((d.op_or_name("Pg", 7), d.op_or_name("Pg@not", 0))))
                 } else {
                     Some(None) // "uniform" guard
@@ -1435,6 +1493,212 @@ fn sharing(plan: &mut Plan, flow: &Flow, _src: &[Decoded]) {
         for &rd in members {
             plan.share.insert(rd, members[0]);
         }
+    }
+}
+
+/// Compact CSR control-flow graph for `Borrowed` liveness and web construction
+/// (skips `pred`, `aligned`, and `compute_whole_places`).
+pub(crate) struct BorrowFlow {
+    pub(crate) known: bool,
+    pub(crate) has_calls: bool,
+    pub(crate) is_call: Vec<bool>,
+    pub(crate) named: Vec<Option<usize>>,
+    succ_off: Vec<u32>,
+    succ_data: Vec<u32>,
+    pub(crate) called: HashMap<usize, CallEffect>,
+}
+
+const BF_PLAIN: u8 = 0;
+const BF_COND: u8 = 1;
+const BF_JUMP: u8 = 2;
+const BF_EXIT: u8 = 3;
+const BF_CALL: u8 = 4;
+const BF_OTHER: u8 = 5;
+
+impl BorrowFlow {
+    pub(crate) fn new(src: &[Decoded], tables: &[(u64, Vec<u64>)]) -> Self {
+        let n = src.len();
+        let mut kind: Vec<u8> = Vec::with_capacity(n);
+        let mut is_call: Vec<bool> = Vec::with_capacity(n);
+        let mut named: Vec<Option<usize>> = vec![None; n];
+        let mut has_calls = false;
+        let mut has_leaves = false;
+        let mut has_meets_src = false;
+        let has_tables = !tables.is_empty();
+        for (i, d) in src.iter().enumerate() {
+            let m = d.mnemonic;
+            let k = if m == "BRA" {
+                if unguarded(d) && true_pp(d) && matches!(d.op_or(OP_COND, 0), 0 | 1) {
+                    BF_JUMP
+                } else {
+                    BF_COND
+                }
+            } else if m == "BRX" {
+                if d.name == "brx_" && has_tables && tables.iter().any(|&(at, _)| at == 16 * i as u64) {
+                    BF_OTHER
+                } else {
+                    return Self::empty(n);
+                }
+            } else if m == "JMX" || m == "JMP" {
+                return Self::empty(n);
+            } else if m == "CALL" {
+                has_calls = true;
+                BF_CALL
+            } else if m == "EXIT" {
+                if unguarded(d) { BF_EXIT } else { BF_OTHER }
+            } else if m == "RET" || LANES.contains(&m) || matches!(m, "BSSY" | "BPT") {
+                if LEAVES.contains(&m) {
+                    has_leaves = true;
+                }
+                if matches!(m, "BSSY" | "PBK" | "SSY" | "PCNT") {
+                    has_meets_src = true;
+                }
+                BF_OTHER
+            } else {
+                if ((d.name.starts_with("brx") || d.name.starts_with("jmx"))
+                    && !(d.name == "brx_" && has_tables && tables.iter().any(|&(at, _)| at == 16 * i as u64)))
+                    || (d.name.starts_with("jmp") && crate::translate::find_relative_decoded(d, 75).is_none())
+                {
+                    return Self::empty(n);
+                }
+                BF_PLAIN
+            };
+            kind.push(k);
+            is_call.push(k == BF_CALL);
+            if matches!(k, BF_JUMP | BF_COND | BF_CALL) || matches!(m, "BSSY" | "PBK" | "SSY" | "PCNT") {
+                if let Some((rel_fid, scale)) = crate::translate::find_relative_decoded(d, 75) {
+                    let v = field::signed(rel_fid, d.word);
+                    let t = 16 * i as i64 + 16 + v * scale as i64;
+                    if t % 16 == 0 && t >= 0 && t < 16 * n as i64 {
+                        named[i] = Some((t / 16) as usize);
+                    }
+                }
+                if (k == BF_JUMP || k == BF_COND) && named[i].is_none() {
+                    return Self::empty(n);
+                }
+            }
+        }
+
+        let meets: Vec<u32> = if has_leaves && has_meets_src {
+            let mut s: BTreeSet<u32> = BTreeSet::new();
+            for i in 0..n {
+                if matches!(src[i].mnemonic, "BSSY" | "PBK" | "SSY" | "PCNT")
+                    && let Some(t) = named[i]
+                {
+                    s.insert(t as u32);
+                }
+            }
+            s.into_iter().collect()
+        } else {
+            Vec::new()
+        };
+
+        let mut succ_off: Vec<u32> = Vec::with_capacity(n + 1);
+        let mut succ_data: Vec<u32> = Vec::with_capacity(n + n / 8);
+        let mut tmp: Vec<u32> = Vec::new();
+        succ_off.push(0);
+        for (i, &k) in kind.iter().enumerate() {
+            let next = if i + 1 < n { Some((i + 1) as u32) } else { None };
+            if k == BF_PLAIN {
+                if let Some(a) = next {
+                    succ_data.push(a);
+                }
+            } else if k == BF_JUMP {
+                if let Some(t) = named[i] {
+                    succ_data.push(t as u32);
+                }
+            } else if k == BF_COND {
+                match (next, named[i].map(|t| t as u32)) {
+                    (Some(a), Some(b)) => {
+                        if a < b {
+                            succ_data.push(a);
+                            succ_data.push(b);
+                        } else if b < a {
+                            succ_data.push(b);
+                            succ_data.push(a);
+                        } else {
+                            succ_data.push(a);
+                        }
+                    }
+                    (Some(a), None) | (None, Some(a)) => succ_data.push(a),
+                    (None, None) => {}
+                }
+            } else if k == BF_EXIT || src[i].mnemonic == "RET" {
+                if !unguarded(&src[i])
+                    && let Some(a) = next
+                {
+                    succ_data.push(a);
+                }
+            } else if src[i].mnemonic == "BRX" {
+                tmp.clear();
+                if let Some((_, places)) = tables.iter().find(|(at, _)| *at == 16 * i as u64) {
+                    for &t in places {
+                        if t % 16 == 0 && (t as usize) < 16 * n {
+                            tmp.push((t / 16) as u32);
+                        }
+                    }
+                }
+                if !unguarded(&src[i])
+                    && let Some(a) = next
+                {
+                    tmp.push(a);
+                }
+                tmp.sort_unstable();
+                tmp.dedup();
+                succ_data.extend_from_slice(&tmp);
+            } else if LEAVES.contains(&src[i].mnemonic) {
+                tmp.clear();
+                if let Some(a) = next {
+                    tmp.push(a);
+                }
+                tmp.extend_from_slice(&meets);
+                tmp.sort_unstable();
+                tmp.dedup();
+                succ_data.extend_from_slice(&tmp);
+            } else if let Some(a) = next {
+                succ_data.push(a);
+            }
+            succ_off.push(succ_data.len() as u32);
+        }
+
+        let called = if has_calls {
+            Flow::compute_call_effects(src, |i| is_call[i], &named, &mut |k, out| {
+                let start = succ_off[k] as usize;
+                let end = succ_off[k + 1] as usize;
+                out.extend(succ_data[start..end].iter().map(|&t| t as usize));
+            })
+        } else {
+            HashMap::new()
+        };
+
+        Self {
+            known: true,
+            has_calls,
+            is_call,
+            named,
+            succ_off,
+            succ_data,
+            called,
+        }
+    }
+
+    fn empty(n: usize) -> Self {
+        Self {
+            known: false,
+            has_calls: false,
+            is_call: vec![false; n],
+            named: Vec::new(),
+            succ_off: Vec::new(),
+            succ_data: Vec::new(),
+            called: HashMap::new(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn succ(&self, i: usize) -> &[u32] {
+        let start = self.succ_off[i] as usize;
+        let end = self.succ_off[i + 1] as usize;
+        &self.succ_data[start..end]
     }
 }
 

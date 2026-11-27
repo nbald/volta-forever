@@ -16,6 +16,26 @@ pub(super) fn budget(registers: u32, info: &[u8]) -> u32 {
 
 /// The most registers a thread may have for a block of `threads` threads to be launched on a
 /// GV100.
+/// Effective resident warps per GV100 subpartition for `registers`, rounding down to whole CTAs
+/// when `info` fixes a CTA size (`EIATTR_REQNTID`).
+pub(super) fn occupancy_warps(registers: u32, info: &[u8]) -> u32 {
+    let regs_per_warp = (32 * registers.max(1)).next_multiple_of(256);
+    let per_sub = (16_384 / regs_per_warp).min(16);
+    if let Some(req) = required_threads(info) {
+        let groups = req.div_ceil(128).max(1);
+        (per_sub / groups) * groups
+    } else {
+        per_sub
+    }
+}
+
+/// Largest register count per thread (`<= 255`) preserving at least `occupancy_warps(registers, info)`
+/// on GV100.
+pub(super) fn occupancy_target(registers: u32, info: &[u8]) -> u32 {
+    let w = occupancy_warps(registers, info);
+    16_384u32.checked_div(w).map_or(255, |n| (n / 256 * 8).min(255))
+}
+
 pub(super) fn registers_for(threads: u32) -> u32 {
     // The per-block admission check rounds warp count up to four
     // subpartitions; each 128-thread group consumes the same allocation.

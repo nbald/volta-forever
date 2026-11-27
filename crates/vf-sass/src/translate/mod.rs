@@ -63,6 +63,8 @@ struct Item {
     says: bool,
     /// The borrowed registers that the sequence it is part of writes for the translation.
     borrows: HashSet<u32>,
+    /// Whether this item leads a borrowed sequence that must wait on prior scoreboards of `borrows`.
+    borrow_wait: bool,
     /// Its result is waited for with that of a later instruction of its sequence: the schedule
     /// treats it like a writer that names a scoreboard.
     covered: bool,
@@ -93,6 +95,7 @@ impl Item {
             also: Vec::new(),
             says: false,
             borrows: HashSet::new(),
+            borrow_wait: false,
             covered: false,
             anew: false,
             more_reads: Vec::new(),

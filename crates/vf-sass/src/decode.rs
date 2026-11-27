@@ -140,6 +140,25 @@ pub fn span_of(span: u16, ops: &[(u16, u32)]) -> u32 {
     SPAN_VALUES[values as usize + index] as u32
 }
 
+/// Calls `f(first)` for each distinct 64-bit (`count == 2`, `first < 62`) uniform operand of `d`.
+pub fn for_each_uniform_pair(d: &Decoded, mut f: impl FnMut(u32)) {
+    let cls = &SM75_CLASSES[d.class_id as usize];
+    let reads = &SM75_READS[cls.12 as usize..(cls.12 + cls.13) as usize];
+    let writes = &SM75_WRITES[cls.14 as usize..(cls.14 + cls.15) as usize];
+    let mut seen = 0u64;
+    for &(letter, name_id, span) in reads.iter().chain(writes) {
+        if letter == LETTER_U
+            && let Some(first) = d.op(name_id)
+            && first < 62
+            && (seen >> first) & 1 == 0
+            && span_of(span, &d.ops) == 2
+        {
+            seen |= 1u64 << first;
+            f(first);
+        }
+    }
+}
+
 /// The uniform registers that an sm_75 instruction reads or writes: for each of its operands, the
 /// first register and how many it takes as one value.
 pub fn uniform_operands(d: &Decoded) -> Vec<(u32, u32)> {
@@ -238,7 +257,8 @@ impl Decoder {
             &VF_DOMAIN_OFFSETS[..]
         };
 
-        let mut matches: Vec<u16> = Vec::new();
+        let mut match_id: u16 = 0;
+        let mut match_cnt: u8 = 0;
 
         // Try opcode fields; sm_75 has fields 0 (13-bit) and 34 (12-bit), sm_70 has field 34 only
         if is_75 {
@@ -253,21 +273,25 @@ impl Decoder {
                 domain_values,
                 domain_offsets,
                 false,
-                &mut matches,
+                &mut match_id,
+                &mut match_cnt,
             );
-            self.check_opcode(
-                word,
-                34,
-                &SM75_OPCODE_34_OFFSETS,
-                &SM75_OPCODE_34_CANDIDATES,
-                classes,
-                const_checks,
-                domain_checks,
-                domain_values,
-                domain_offsets,
-                false,
-                &mut matches,
-            );
+            if match_cnt < 2 {
+                self.check_opcode(
+                    word,
+                    34,
+                    &SM75_OPCODE_34_OFFSETS,
+                    &SM75_OPCODE_34_CANDIDATES,
+                    classes,
+                    const_checks,
+                    domain_checks,
+                    domain_values,
+                    domain_offsets,
+                    false,
+                    &mut match_id,
+                    &mut match_cnt,
+                );
+            }
         } else {
             self.check_opcode(
                 word,
@@ -280,15 +304,16 @@ impl Decoder {
                 domain_values,
                 domain_offsets,
                 true,
-                &mut matches,
+                &mut match_id,
+                &mut match_cnt,
             );
         }
 
-        if matches.len() != 1 {
+        if match_cnt != 1 {
             return None;
         }
 
-        let class_id = matches[0];
+        let class_id = match_id;
         let cls = &classes[class_id as usize];
         let operands = if is_75 { &SM75_OPERANDS[..] } else { &VF_OPERANDS[..] };
         let reads_desc = if is_75 { &SM75_READS[..] } else { &VF_READS[..] };
@@ -346,7 +371,8 @@ impl Decoder {
         domain_values: &[u32],
         domain_offsets: &[(u32, u16)],
         check_unused: bool,
-        matches: &mut Vec<u16>,
+        match_id: &mut u16,
+        match_cnt: &mut u8,
     ) {
         let opcode_val = field::get(opcode_fid, word) as usize;
         if opcode_val >= offsets.len() {
@@ -392,7 +418,13 @@ impl Decoder {
                     continue;
                 }
             }
-            matches.push(class_id);
+            if *match_cnt == 0 {
+                *match_id = class_id;
+                *match_cnt = 1;
+            } else {
+                *match_cnt = 2;
+                return;
+            }
         }
     }
 
@@ -411,13 +443,20 @@ impl Decoder {
     }
 
     fn compute_reads(&self, ops: &[(u16, u32)], reads_desc: &[(u8, u16, u16)]) -> Vec<(u8, u32, u8)> {
-        let mut reads = Vec::new();
+        if reads_desc.is_empty() {
+            return Vec::new();
+        }
+        let mut reads = Vec::with_capacity(reads_desc.len());
         for &(letter, name_id, span) in reads_desc {
             if let Some(&(_, val)) = ops.iter().find(|&&(n, _)| n == name_id)
                 && val != zero_of(letter)
             {
-                let name = OP_NAMES[name_id as usize];
-                let role = if name == "Pg" || name == "UPg" { 1u8 } else { 0u8 };
+                let role = if name_id == crate::generated::fields::OP_PG || name_id == crate::generated::fields::OP_UPG
+                {
+                    1u8
+                } else {
+                    0u8
+                };
                 for i in 0..span_of(span, ops) {
                     reads.push((letter, val + i, role));
                 }
@@ -427,7 +466,10 @@ impl Decoder {
     }
 
     fn compute_writes(&self, ops: &[(u16, u32)], writes_desc: &[(u8, u16, u16)]) -> Vec<(u8, u32)> {
-        let mut writes = Vec::new();
+        if writes_desc.is_empty() {
+            return Vec::new();
+        }
+        let mut writes = Vec::with_capacity(writes_desc.len());
         for &(letter, name_id, span) in writes_desc {
             if let Some(&(_, val)) = ops.iter().find(|&&(n, _)| n == name_id)
                 && val != zero_of(letter)

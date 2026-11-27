@@ -91,11 +91,9 @@ pub(super) fn parse_function(
     if !code.len().is_multiple_of(16) {
         return Err(Refused("code that is not a whole number of instructions".into()));
     }
-    let words: Vec<u128> = (0..code.len() / 16)
-        .map(|i| u128::from_le_bytes(code[i * 16..(i + 1) * 16].try_into().unwrap()))
-        .collect();
-    let mut src = Vec::with_capacity(words.len());
-    for (i, &w) in words.iter().enumerate() {
+    let mut src = Vec::with_capacity(code.len() / 16);
+    for (i, chunk) in code.as_chunks::<16>().0.iter().enumerate() {
+        let w = u128::from_le_bytes(*chunk);
         match dec75.decode(w) {
             Some(d) => src.push(d),
             None => {

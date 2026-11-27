@@ -345,7 +345,7 @@ fn borrowed_home_only_in_free_register() {
     let b = Borrowed::new(&fd, false, None).unwrap();
     // U4 should NOT get a home because R2..R7 are all busy in the span.
     assert!(
-        b.homes.is_empty(),
+        b.web_homes.is_empty(),
         "no home should be found when all registers are busy"
     );
 }
@@ -374,7 +374,7 @@ fn borrowed_never_takes_r0_r1() {
         false,
     );
     let b = Borrowed::new(&fd, false, None).unwrap();
-    for (&_u, &r) in &b.homes {
+    for &(_, r, _) in &b.web_homes {
         assert!(r >= 2, "R0 and R1 must never be taken as homes");
     }
     for &r in &b.used {
@@ -405,8 +405,8 @@ fn borrowed_no_shared_home_for_overlapping_lives() {
         false,
     );
     let b = Borrowed::new(&fd, false, None).unwrap();
-    if b.homes.contains_key(&4) && b.homes.contains_key(&5) {
-        assert_ne!(b.homes[&4], b.homes[&5], "overlapping lives must not share a home");
+    if let (Some(r4), Some(r5)) = (b.home_at(0, 4), b.home_at(0, 5)) {
+        assert_ne!(r4, r5, "overlapping lives must not share a home");
     }
 }
 
@@ -639,8 +639,12 @@ fn free_at_skips_given() {
         taken: vec![regset_empty()],
         touch: vec![regset_empty()],
         never: regset_empty(),
-        homes: HashMap::new(),
-        spans: HashMap::new(),
+        late_read_counts: [0u32; 256],
+        board_costs: [0u32; 256],
+        home_at_insn: vec![Vec::new()],
+        web_homes: Vec::new(),
+        unhomed_u: HashSet::new(),
+        unhomed_pairs: HashSet::new(),
         used: HashSet::new(),
         everything: false,
         slots: HashMap::new(),
@@ -683,8 +687,12 @@ fn free_at_returns_none_when_full() {
         taken: vec![regset_empty()],
         touch: vec![regset_empty()],
         never: regset_empty(),
-        homes: HashMap::new(),
-        spans: HashMap::new(),
+        late_read_counts: [0u32; 256],
+        board_costs: [0u32; 256],
+        home_at_insn: vec![Vec::new()],
+        web_homes: Vec::new(),
+        unhomed_u: HashSet::new(),
+        unhomed_pairs: HashSet::new(),
         used: HashSet::new(),
         everything: false,
         slots: HashMap::new(),
@@ -1077,7 +1085,7 @@ fn uimad_stride_and_wide_kernel_translates_and_preserves_pairs() {
         "/../../tests/kernels/translate/k_uimad.sm75.cubin"
     ));
     let mut decoder = Decoder::new(70);
-    for borrow in [Options::default().borrow, 8] {
+    for borrow in [Options::default().borrow, 1, 8] {
         let options = Options {
             borrow,
             ..Options::default()
@@ -1113,7 +1121,33 @@ fn uimad_stride_and_wide_kernel_translates_and_preserves_pairs() {
         assert_eq!(rd % 2, 0);
         assert_eq!(d_wide.op_or_name("Rc", 255), rd);
         let (_, d_hi_read) = decode_at("k_uimad_wide_hi", 0x80);
-        assert_eq!(d_hi_read.op_or_name("Rc", 255), rd + 1);
+        if borrow == 8 {
+            // Level 3 holds uniform registers in local memory slots and reloads per instruction:
+            // 0x60 stores UR4:UR5 from rd:rd+1, and 0x80 loads UR5 into its per-instruction scratch.
+            let code = &out.sections[out.section(".text.k_uimad_wide_hi").unwrap()].data;
+            let st_hi = map
+                .iter()
+                .find(|(f, _, old, w)| f == "k_uimad_wide_hi" && *old == 0x60 && w == "mem: store UR5")
+                .unwrap();
+            let d_st_hi = decoder
+                .decode(u128::from_le_bytes(
+                    code[st_hi.1 as usize..st_hi.1 as usize + 16].try_into().unwrap(),
+                ))
+                .unwrap();
+            assert_eq!(d_st_hi.op_or_name("Rb", 255), rd + 1);
+            let ld_hi = map
+                .iter()
+                .find(|(f, _, old, w)| f == "k_uimad_wide_hi" && *old == 0x80 && w == "mem: load UR5")
+                .unwrap();
+            let d_ld_hi = decoder
+                .decode(u128::from_le_bytes(
+                    code[ld_hi.1 as usize..ld_hi.1 as usize + 16].try_into().unwrap(),
+                ))
+                .unwrap();
+            assert_eq!(d_hi_read.op_or_name("Rc", 255), d_ld_hi.op_or_name("Rd", 255));
+        } else {
+            assert_eq!(d_hi_read.op_or_name("Rc", 255), rd + 1);
+        }
     }
 }
 
@@ -1577,4 +1611,537 @@ fn a_result_of_double_precision_is_read_no_earlier_than_volta_reads_one() {
     // A writer earlier in the code that goes on to that place.
     let through = ends(&[with_stall(board(DSETP, 0), 2, false), nop, nop], &[32], true);
     assert_eq!(through[0] + through[1], 15, "{through:?}");
+}
+
+/// A stackless kernel whose translated register count crosses a GV100 warp occupancy cliff
+/// recovers a full warp tier via zero-spill borrowing without allocating a local frame, while
+/// a function with a local stack frame (`EIATTR_FRAME_SIZE > 0` / `LDL`/`STL`, such as
+/// `k_pairs::p_callee` with `STACK:128`) skips occupancy-cliff borrowing to avoid local-stack
+/// contention.
+#[test]
+fn occupancy_cliff_recovers_full_warp_tier_without_spills() {
+    let groups = include_bytes!("../../../../tests/kernels/k_groups.135.sm75.cubin");
+    let without_cliff = translate_with_options(
+        groups,
+        false,
+        &Options {
+            borrow: 6,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    let with_cliff = translate_with_options(groups, true, &Options::default()).unwrap();
+    let out_b6 = crate::elf::Elf::parse(&without_cliff.bytes).unwrap();
+    let out_b7 = crate::elf::Elf::parse(&with_cliff.bytes).unwrap();
+    let map = with_cliff.map.unwrap();
+    for name in ["g_shared", "g_once"] {
+        let report = with_cliff.report.iter().find(|r| r.name == name).unwrap();
+        assert_eq!(report.refused, None);
+        let c6 = out_b6.sections[out_b6.section(&format!(".text.{name}")).unwrap()].info >> 24;
+        let c7 = out_b7.sections[out_b7.section(&format!(".text.{name}")).unwrap()].info >> 24;
+        assert_eq!(c6, 82, "expected {name} without cliff recovery to take 82 registers");
+        assert!(
+            c7 <= 80,
+            "expected {name} to recover <= 80 registers (6 warps/subpartition), got {c7}"
+        );
+        assert!(
+            !map.iter().any(|(f, _, _, what)| f == name && what.starts_with("mem:")),
+            "occupancy recovery must stay zero-spill without local-memory frame ops"
+        );
+    }
+
+    // A kernel with a local stack frame (`STACK:128`, `LDL`/`STL`) must NOT cross down for
+    // occupancy cliffs (staying at its level-0 count of 65 registers instead of borrowing into
+    // local-stack contention).
+    let pairs = include_bytes!("../../../../tests/kernels/k_pairs.135.sm75.cubin");
+    let pairs_b6 = translate_with_options(
+        pairs,
+        false,
+        &Options {
+            borrow: 6,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    let pairs_b7 = translate_with_options(pairs, false, &Options::default()).unwrap();
+    let p_b6 = crate::elf::Elf::parse(&pairs_b6.bytes).unwrap();
+    let p_b7 = crate::elf::Elf::parse(&pairs_b7.bytes).unwrap();
+    let r_b6 = p_b6.sections[p_b6.section(".text.p_callee").unwrap()].info >> 24;
+    let r_b7 = p_b7.sections[p_b7.section(".text.p_callee").unwrap()].info >> 24;
+    assert_eq!(r_b6, 65);
+    assert_eq!(
+        r_b7, r_b6,
+        "local-frame p_callee must stay un-lowered at {r_b6} registers under default borrow=7, got {r_b7}"
+    );
+}
+
+/// Disjoint SSA value-flow webs of the same uniform register may occupy different ordinary
+/// registers when no single register is free across both webs.
+#[test]
+fn borrowed_splits_disjoint_uniform_webs_to_break_cliff() {
+    // Web 1 at [0, 1]: R2 is free, R3..R4 are busy.
+    // Gap at [2]: UR4 is dead, R2 is written and kept live across [3, 4] while R3 becomes free.
+    // Web 2 at [3, 4]: R3 is free, R2 and R4 are busy.
+    let fd = make_borrow_func(
+        &[
+            (&[(LETTER_R, 3, 0), (LETTER_R, 4, 0)], &[(LETTER_U, 4)]),
+            (&[(LETTER_U, 4, 0), (LETTER_R, 3, 0), (LETTER_R, 4, 0)], &[]),
+            (&[(LETTER_R, 4, 0)], &[(LETTER_R, 2)]),
+            (&[(LETTER_R, 2, 0), (LETTER_R, 4, 0)], &[(LETTER_U, 4)]),
+            (&[(LETTER_U, 4, 0), (LETTER_R, 2, 0), (LETTER_R, 4, 0)], &[]),
+            (&[(LETTER_R, 4, 0)], &[]),
+        ],
+        4,
+        &[4],
+        &[],
+        false,
+    );
+    let b = Borrowed::new(&fd, false, None).unwrap();
+    assert!(b.unhomed_u.is_empty(), "split webs should all find homes");
+    assert_eq!(b.web_homes.len(), 2);
+    assert_eq!(b.home_at(0, 4), Some(2));
+    assert_eq!(b.home_at(1, 4), Some(2));
+    assert_eq!(b.home_at(2, 4), None);
+    assert_eq!(b.home_at(3, 4), Some(3));
+    assert_eq!(b.home_at(4, 4), Some(3));
+}
+
+/// Exact internal CALL.REL/RET.REL subroutines follow caller liveness instead of treating every
+/// register of the function as live at the return.
+#[test]
+fn borrowed_exact_call_rel_liveness_avoids_spurious_busy() {
+    let mut dec75 = Decoder::new(75);
+    let nop_word: u128 = 0x000fc00000000000_0000000000007918;
+    // CALL.REL target = 16*0 + 16 + 0x20 = 0x30 (insn 3).
+    let call_rel_word: u128 = 0x000fea0003c00000_0000002000007944;
+    let exit_word: u128 = 0x000fea0003800000_000000000000794d;
+    let ret_rel_word: u128 = 0x000fee0003c3ffff_ffffe6a004007950;
+    let mut src = Vec::new();
+    // 0: call_rel -> insn 3
+    let mut d0 = dec75.decode(call_rel_word).unwrap();
+    d0.reads = vec![];
+    d0.writes = vec![];
+    src.push(d0);
+    // 1: R10 written and immediately overwritten/dead after call (dead across call!)
+    let mut d1 = dec75.decode(nop_word).unwrap();
+    d1.reads = vec![];
+    d1.writes = vec![(LETTER_R, 10)];
+    src.push(d1);
+    // 2: EXIT
+    let mut d2 = dec75.decode(exit_word).unwrap();
+    d2.reads = vec![];
+    d2.writes = vec![];
+    src.push(d2);
+    // 3: callee writes UR4, reads R2
+    let mut d3 = dec75.decode(nop_word).unwrap();
+    d3.reads = vec![(LETTER_R, 2, 0)];
+    d3.writes = vec![(LETTER_U, 4)];
+    src.push(d3);
+    // 4: callee reads UR4, R2..R9 busy
+    let mut d4 = dec75.decode(nop_word).unwrap();
+    d4.reads = vec![
+        (LETTER_U, 4, 0),
+        (LETTER_R, 2, 0),
+        (LETTER_R, 3, 0),
+        (LETTER_R, 4, 0),
+        (LETTER_R, 5, 0),
+        (LETTER_R, 6, 0),
+        (LETTER_R, 7, 0),
+        (LETTER_R, 8, 0),
+        (LETTER_R, 9, 0),
+    ];
+    d4.writes = vec![];
+    src.push(d4);
+    // 5: ret__REL
+    let mut d5 = dec75.decode(ret_rel_word).unwrap();
+    d5.reads = vec![];
+    d5.writes = vec![];
+    src.push(d5);
+
+    let fd = FuncData {
+        name: "call_rel_liveness_test".into(),
+        registers: 11,
+        tables: vec![],
+        src,
+        uniform: vec![4],
+        pairs: vec![],
+        needs_pool: false,
+        uniform_predicates: vec![],
+        highest: 10,
+        scratch_need: 0,
+        needs_lane: false,
+        product_count: 0,
+        entered_inside: false,
+        ampere: false,
+        ampere_ops: HashMap::new(),
+    };
+    let b = Borrowed::new(&fd, false, None).unwrap();
+    assert!(
+        !regset_test(&b.busy[3], 10) && !regset_test(&b.busy[4], 10) && !regset_test(&b.busy[5], 10),
+        "R10 is dead across the exact CALL.REL and must not be marked busy inside the callee"
+    );
+    assert_eq!(b.home_at(3, 4), Some(10));
+    assert_eq!(b.home_at(4, 4), Some(10));
+}
+
+/// When an instruction reads a borrowed home late and a following program instruction writes that
+/// same register before a branch, the translator emits a wait on the read scoreboard.
+#[test]
+fn late_read_of_borrowed_home_waits_before_program_write() {
+    let original = include_bytes!("../../../../tests/kernels/translate/k_convert.sm75.cubin");
+    let opts = Options {
+        borrow: 1,
+        ..Options::default()
+    };
+    let result = translate_with_options(original, false, &opts).unwrap();
+    let out = crate::elf::Elf::parse(&result.bytes).unwrap();
+    let text = &out.sections[out.section(".text.k_uniform_double").unwrap()];
+    let mut dec70 = Decoder::new(70);
+    let words: Vec<u128> = text
+        .data
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .map(|c| u128::from_le_bytes(*c))
+        .collect();
+    let mut verified_war = false;
+    for k in 0..words.len() - 1 {
+        let d = dec70.decode(words[k]).unwrap();
+        if d.name == "i2f_Rd64__Rb_16b" && d.reads.iter().any(|&(l, r, _)| l == LETTER_R && r == 2) {
+            let rb = ((words[k] >> 113) & 7) as u32;
+            let d_next = dec70.decode(words[k + 1]).unwrap();
+            if d_next.writes.iter().any(|&(l, r)| l == LETTER_R && r == 2) {
+                assert_ne!(rb, 7, "late reader of borrowed R2 must set a read scoreboard");
+                let wait_mask = ((words[k + 1] >> 116) & 63) as u32;
+                assert_ne!(
+                    (wait_mask >> rb) & 1,
+                    0,
+                    "following write to R2 must wait on read scoreboard {rb}"
+                );
+                verified_war = true;
+            }
+        }
+    }
+    assert!(
+        verified_war,
+        "expected i2f_Rd64__Rb_16b -> R2 writer pair in k_uniform_double"
+    );
+}
+
+/// An inexact `RET.REL` flows back to every `CALL.REL` continuation in the function; any uniform
+/// register live across that continuation must keep the same home at the return and continuation.
+#[test]
+fn borrowed_inexact_ret_rel_unions_with_call_rel_continuation() {
+    let mut dec75 = Decoder::new(75);
+    let nop_word: u128 = 0x000fc00000000000_0000000000007918;
+    // CALL.REL target = 16*0 + 16 + 0x20 = 0x30 (insn 3).
+    let call_rel_to3: u128 = 0x000fea0003c00000_0000002000007944;
+    // CALL.REL target = 16*4 + 16 - 16 = 0x40 (insn 4, self-calling -> inexact).
+    let call_rel_to4: u128 = 0x000fea0003c00000_fffffff000007944;
+    let exit_word: u128 = 0x000fea0003800000_000000000000794d;
+    let ret_rel_word: u128 = 0x000fee0003c3ffff_ffffe6a004007950;
+    let mut src = Vec::new();
+    // 0: exact call_rel -> insn 3 (only R3 read inside insn 3, leaving R2 free at insn 1)
+    let mut d0 = dec75.decode(call_rel_to3).unwrap();
+    d0.reads = vec![];
+    d0.writes = vec![];
+    src.push(d0);
+    // 1: continuation after call 0 reads UR4 while R3 is busy (R2 free)
+    let mut d1 = dec75.decode(nop_word).unwrap();
+    d1.reads = vec![(LETTER_U, 4, 0), (LETTER_R, 3, 0)];
+    d1.writes = vec![];
+    src.push(d1);
+    // 2: EXIT
+    let mut d2 = dec75.decode(exit_word).unwrap();
+    d2.reads = vec![];
+    d2.writes = vec![];
+    src.push(d2);
+    // 3: exact ret__REL for insn 0 reading R3
+    let mut d3 = dec75.decode(ret_rel_word).unwrap();
+    d3.reads = vec![(LETTER_R, 3, 0)];
+    d3.writes = vec![];
+    src.push(d3);
+    // 4: inexact self-call_rel -> insn 4, falling through to insn 5
+    let mut d4 = dec75.decode(call_rel_to4).unwrap();
+    d4.reads = vec![];
+    d4.writes = vec![];
+    src.push(d4);
+    // 5: inexact ret__REL reading R2; every_r={R2, R3} blocks all homes in R2..=R3 here
+    let mut d5 = dec75.decode(ret_rel_word).unwrap();
+    d5.reads = vec![(LETTER_R, 2, 0)];
+    d5.writes = vec![];
+    src.push(d5);
+
+    let fd = FuncData {
+        name: "inexact_ret_rel_hc_test".into(),
+        registers: 4,
+        tables: vec![],
+        src,
+        uniform: vec![4],
+        pairs: vec![],
+        needs_pool: false,
+        uniform_predicates: vec![],
+        highest: 3,
+        scratch_need: 0,
+        needs_lane: false,
+        product_count: 0,
+        entered_inside: false,
+        ampere: false,
+        ampere_ops: HashMap::new(),
+    };
+    let b = Borrowed::new(&fd, false, None).unwrap();
+    assert_eq!(
+        b.home_at(5, 4),
+        b.home_at(1, 4),
+        "UR4 home must remain identical across inexact ret__REL -> call_rel+1 edge"
+    );
+    assert!(b.unhomed_u.contains(&4));
+}
+
+/// Registers kept live in the caller across an exact `CALL.REL`/`RET.REL` remain busy inside the
+/// subroutine so borrowed pools or homes inside the callee cannot overwrite caller-live values.
+#[test]
+fn borrowed_exact_call_rel_preserves_caller_live_out_registers() {
+    let mut dec75 = Decoder::new(75);
+    let nop_word: u128 = 0x000fc00000000000_0000000000007918;
+    // CALL.REL at insn 1: target = 16*1 + 16 + 0x20 = 0x40 (insn 4).
+    let call_rel_to4: u128 = 0x000fea0003c00000_0000002000007944;
+    let exit_word: u128 = 0x000fea0003800000_000000000000794d;
+    let ret_rel_word: u128 = 0x000fee0003c3ffff_ffffe6a004007950;
+    let mut src = Vec::new();
+    // 0: caller defines R2
+    let mut d0 = dec75.decode(nop_word).unwrap();
+    d0.reads = vec![];
+    d0.writes = vec![(LETTER_R, 2)];
+    src.push(d0);
+    // 1: exact call_rel -> insn 4 while R2 is live-out across the call
+    let mut d1 = dec75.decode(call_rel_to4).unwrap();
+    d1.reads = vec![];
+    d1.writes = vec![];
+    src.push(d1);
+    // 2: caller reads R2 after returning from insn 4
+    let mut d2 = dec75.decode(nop_word).unwrap();
+    d2.reads = vec![(LETTER_R, 2, 0)];
+    d2.writes = vec![];
+    src.push(d2);
+    // 3: EXIT
+    let mut d3 = dec75.decode(exit_word).unwrap();
+    d3.reads = vec![];
+    d3.writes = vec![];
+    src.push(d3);
+    // 4: callee writes UR4 and keeps R3..R9 busy (R2 and R10 untouched inside callee)
+    let mut d4 = dec75.decode(nop_word).unwrap();
+    d4.reads = vec![
+        (LETTER_R, 3, 0),
+        (LETTER_R, 4, 0),
+        (LETTER_R, 5, 0),
+        (LETTER_R, 6, 0),
+        (LETTER_R, 7, 0),
+        (LETTER_R, 8, 0),
+        (LETTER_R, 9, 0),
+    ];
+    d4.writes = vec![(LETTER_U, 4)];
+    src.push(d4);
+    // 5: callee reads UR4 and R3..R9
+    let mut d5 = dec75.decode(nop_word).unwrap();
+    d5.reads = vec![
+        (LETTER_U, 4, 0),
+        (LETTER_R, 3, 0),
+        (LETTER_R, 4, 0),
+        (LETTER_R, 5, 0),
+        (LETTER_R, 6, 0),
+        (LETTER_R, 7, 0),
+        (LETTER_R, 8, 0),
+        (LETTER_R, 9, 0),
+    ];
+    d5.writes = vec![];
+    src.push(d5);
+    // 6: ret__REL
+    let mut d6 = dec75.decode(ret_rel_word).unwrap();
+    d6.reads = vec![];
+    d6.writes = vec![];
+    src.push(d6);
+
+    let fd = FuncData {
+        name: "call_rel_caller_live_out_test".into(),
+        registers: 11,
+        tables: vec![],
+        src,
+        uniform: vec![4],
+        pairs: vec![],
+        needs_pool: false,
+        uniform_predicates: vec![],
+        highest: 10,
+        scratch_need: 0,
+        needs_lane: false,
+        product_count: 0,
+        entered_inside: false,
+        ampere: false,
+        ampere_ops: HashMap::new(),
+    };
+    let b = Borrowed::new(&fd, false, None).unwrap();
+    assert!(
+        regset_test(&b.busy[4], 2) && regset_test(&b.busy[5], 2) && regset_test(&b.busy[6], 2),
+        "R2 live across CALL.REL must remain busy inside exact callee"
+    );
+    assert!(
+        !regset_test(&b.busy[4], 10),
+        "dead R10 should stay free inside exact callee"
+    );
+    assert_eq!(b.home_at(4, 4), Some(10));
+    assert_eq!(b.home_at(5, 4), Some(10));
+}
+
+/// Pool allocation via `free_at` skips registers heavily read late (`MioFast`/`MioSlow`/`FMALITE`/
+/// `HMMA` with `rb == 7`), and stays within `highest.min(top)` at level 1/2 instead of escaping
+/// above `highest`.
+#[test]
+fn free_at_avoids_late_read_and_exceeding_highest() {
+    let mut b = Borrowed {
+        top: 61,
+        highest: 5,
+        busy: vec![regset_empty()],
+        taken: vec![regset_empty()],
+        touch: vec![regset_empty()],
+        never: regset_empty(),
+        late_read_counts: [0u32; 256],
+        board_costs: [0u32; 256],
+        home_at_insn: vec![Vec::new()],
+        web_homes: Vec::new(),
+        unhomed_u: HashSet::new(),
+        unhomed_pairs: HashSet::new(),
+        used: HashSet::new(),
+        everything: false,
+        slots: HashMap::new(),
+        predicate_slots: HashMap::new(),
+        frame_bytes: 0,
+        depth: vec![None],
+        r1_fixed: true,
+        room: false,
+        from_r1: false,
+        spill: 0,
+    };
+    b.late_read_counts[2] = 10;
+    b.late_read_counts[3] = 10;
+    // R4:R5 has zero late reads and lies within highest=5 (must pick R4 over late-read R2 and >highest R6).
+    assert_eq!(b.free_at(0, 2, &regset_empty()), Some(4));
+    // Once R4:R5 is busy, level 2 (!everything) must NOT jump above highest=5 (returns R2 instead of R6).
+    regset_set(&mut b.busy[0], 4);
+    assert_eq!(b.free_at(0, 2, &regset_empty()), Some(2));
+    // And in k_pairs::p_callee, dynamic pool borrowing (under VF_BORROW=1) must avoid heavily
+    // late-read R2:R3 (keeping LDG/STG instructions reading R2 free of injected read scoreboards).
+    let original = include_bytes!("../../../../tests/kernels/k_pairs.135.sm75.cubin");
+    let borrow1 = Options {
+        borrow: 1,
+        ..Options::default()
+    };
+    let result = translate_with_options(original, false, &borrow1).unwrap();
+    let out = crate::elf::Elf::parse(&result.bytes).unwrap();
+    let text = &out.sections[out.section(".text.p_callee").unwrap()];
+    let mut dec70 = Decoder::new(70);
+    let mut r2_late_readers = 0usize;
+    let mut r2_rb_injected = 0usize;
+    for chunk in text.data.as_chunks::<16>().0 {
+        let word = u128::from_le_bytes(*chunk);
+        if let Some(d) = dec70.decode(word)
+            && d.kind.is_late()
+            && d.reads.iter().any(|&(l, r, _)| l == LETTER_R && r == 2)
+        {
+            r2_late_readers += 1;
+            let rb = ((word >> crate::generated::special::READ_BARRIER) & 7) as u32;
+            if rb != 7 {
+                r2_rb_injected += 1;
+            }
+        }
+    }
+    assert!(r2_late_readers >= 30, "expected >= 30 late readers of R2 in p_callee");
+    // Before preferring non-late registers, pool-borrowing R2:R3 injected read barriers on all 33
+    // LDG/STG readers of R2. Now R25 is chosen instead, so only the single STG reading R25 gets rb != 7.
+    assert!(
+        r2_rb_injected <= 1,
+        "p_callee should avoid R2:R3 for pool borrowing (had {r2_rb_injected} R2 readers with rb != 7)"
+    );
+}
+
+/// `Borrowed::free_at` skips scoreboard-bound registers (especially `MioSlow` writers) when a
+/// zero-wait register pair is available, even when `late_read_counts` is zero for both.
+#[test]
+fn free_at_avoids_scoreboard_bound_registers() {
+    let mut dec75 = Decoder::new(75);
+    let nop_word: u128 = 0x000fc00000000000_0000000000007918;
+    let mut ldg = dec75.decode(nop_word).unwrap();
+    ldg.kind = Kind::MioSlow;
+    ldg.word = (nop_word & !(7u128 << crate::generated::special::WRITE_BARRIER))
+        | (5u128 << crate::generated::special::WRITE_BARRIER);
+    ldg.writes = vec![(LETTER_R, 2)];
+
+    let mut plain = dec75.decode(nop_word).unwrap();
+    plain.writes = vec![(LETTER_R, 5)];
+
+    let mut read_r5 = dec75.decode(nop_word).unwrap();
+    read_r5.reads = vec![(LETTER_R, 5, 0)];
+
+    let nop = dec75.decode(nop_word).unwrap();
+    let fd = FuncData {
+        name: "test_board_costs".into(),
+        registers: 10,
+        tables: vec![],
+        src: vec![ldg, nop, plain, read_r5],
+        uniform: vec![],
+        pairs: vec![],
+        needs_pool: true,
+        uniform_predicates: vec![],
+        highest: 5,
+        scratch_need: 0,
+        needs_lane: false,
+        product_count: 0,
+        entered_inside: false,
+        ampere: false,
+        ampere_ops: HashMap::new(),
+    };
+    let b = Borrowed::new(&fd, false, None).unwrap();
+    assert_eq!(
+        b.free_at(1, 2, &regset_empty()),
+        Some(4),
+        "free_at should pick zero-wait R4:R5 over MioSlow-written R2:R3"
+    );
+}
+
+/// First writes to borrowed pool registers wait only on scoreboards that write or late-read those
+/// specific registers (excluding unrelated scoreboards and immediate `rb` announcements on the
+/// translated instruction itself such as `on the product`).
+#[test]
+fn borrowed_pool_wait_excludes_unrelated_scoreboards() {
+    let original = include_bytes!("../../../../tests/kernels/k_pairs.135.sm75.cubin");
+    let borrow1 = Options {
+        borrow: 1,
+        ..Options::default()
+    };
+    let result = translate_with_options(original, false, &borrow1).unwrap();
+    let out = crate::elf::Elf::parse(&result.bytes).unwrap();
+    let text = &out.sections[out.section(".text.p_callee").unwrap()];
+    let mut dec70 = Decoder::new(70);
+    let words: Vec<u128> = text
+        .data
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .map(|c| u128::from_le_bytes(*c))
+        .collect();
+    // At 0x01d0 (`SHF` borrowing R25 before `STS` `on the product`), the wait must include only
+    // scoreboards touching R25 (`0b111000`), not unrelated SB0..SB2 or the immediate `STS` `rb=0`.
+    let idx = 0x01d0 / 16;
+    let d = dec70.decode(words[idx]).unwrap();
+    assert_eq!(d.mnemonic, "SHF");
+    let wait_mask = ((words[idx] >> crate::generated::special::WAIT) & 63) as u32;
+    assert_ne!(wait_mask, 63, "borrow wait must not serialize on all 6 scoreboards");
+    assert!(
+        d.writes.iter().any(|&(l, r)| l == LETTER_R && r == 25),
+        "expected p_callee+0x01d0 SHF to write borrowed R25, got {:?}",
+        d.writes
+    );
+    assert_eq!(
+        wait_mask, 0b111000,
+        "p_callee+0x01d0 wait mask must cover only R25's scoreboards (excluding SB0..SB2)"
+    );
 }

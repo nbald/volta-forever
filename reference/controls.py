@@ -154,6 +154,9 @@ at the default; with VF_BORROW=1 every function does:
     pool_in_home_unsaid
                 as overlap_pool, and no line of the declarations says that the pair is taken
                 where it is the home of a uniform register that is alive
+    split_home  one instruction of a value-flow web is given a different free register as its home
+    caller_live_in_callee
+                registers kept live across an exact CALL.REL are omitted from the callee's busy set
 
 With a frame in the thread's local memory (levels 2 and 3; VF_BORROW=8 puts every function at
 level 3):
@@ -918,6 +921,8 @@ def patched(control):
         'overlap_pool': {},
         'short_home': {},
         'pool_in_home_unsaid': {},
+        'split_home': {},
+        'caller_live_in_callee': {},
         'unpaired': {'translate': unpaired_translate, 'from_memory': unpaired_from_memory},
         'misruled': {'one': misruled_one},
     }
@@ -938,9 +943,9 @@ def patched(control):
                 if u in self._mem_regs and u + 1 in self._mem_regs:
                     r = self._mem_regs[u]
                     if r % 2 == 0:
-                        # Shift to odd: use r+1 and r+2 instead of r and r+1
+                        # Shift to odd inside [2, top]: r+1..r+2 unless r+2 exceeds top.
                         old_r, old_r1 = self._mem_regs[u], self._mem_regs[u + 1]
-                        new_r = r + 1
+                        new_r = r - 1 if r + 2 > self.borrow.top and r >= 3 else r + 1
                         self._mem_regs[u] = new_r
                         self._mem_regs[u + 1] = new_r + 1
                         for item in items:
@@ -1148,9 +1153,18 @@ def patched(control):
 
     def from_memory_into_home(self, i, d):
         items = from_memory(self, i, d)
-        if items and self.borrow is not None and self.borrow.homes:
-            homes = self.borrow.homes
-            there = [homes[u] for l, u, *_ in d.reads if l == 'U' and u in homes] + [homes[u] for l, u in d.writes if l == 'U' and u in homes]
+        if items and self.borrow is not None and self.borrow.web_homes:
+            there = []
+            for l, u, *_ in d.reads:
+                if l == 'U':
+                    r = self.borrow.home_at(i, u)
+                    if r is not None:
+                        there.append(r)
+            for l, u in d.writes:
+                if l == 'U':
+                    r = self.borrow.home_at(i, u)
+                    if r is not None:
+                        there.append(r)
             mine = alone(self, d)
             if there and mine:
                 load_into(self, items, mine[0], there[0])
@@ -1344,7 +1358,7 @@ CONTROLS = ['as it is', 'unsaved', 'blind', 'cut', 'masks', 'nowait', 'close', '
 PAIR_CONTROLS = ['rowlane', 'otherrow', 'rowwait', 'rowread', 'halfswap', 'halfk', 'inplace', 'stepfast', 'unsettled', 'unsynced', 'unpermuted', 'unconverted', 'notalso']
 CONTROLS += PAIR_CONTROLS
 # (Those of borrowed registers: only when VF_BORROW=1.)
-BORROW_CONTROLS = ['alive_pair', 'alive_home', 'no_borrow_wait', 'no_late_borrow', 'written_pair', 'shared_home', 'overlap_pool', 'short_home', 'pool_in_home_unsaid']
+BORROW_CONTROLS = ['alive_pair', 'alive_home', 'no_borrow_wait', 'no_late_borrow', 'written_pair', 'shared_home', 'overlap_pool', 'short_home', 'pool_in_home_unsaid', 'split_home', 'caller_live_in_callee']
 CONTROLS += BORROW_CONTROLS
 # (Those of level 3: only when VF_BORROW>=2 and a function uses the frame.)
 FRAME_CONTROLS = ['no_lane_l3', 'odd_pair_l3', 'no_r1_lower', 'wrong_r1_lower', 'wrong_slot_load', 'no_store_l3', 'held_busy_l3', 'unkept_holder_l3', 'shared_holder_l3', 'home_unsaid', 'guarded_store_l3', 'no_old_load_l3', 'no_load_wait', 'store_no_read_sb', 'wrong_base_const', 'missing_pool_line', 'room_lane_unsaid', 'no_attr_raise', 'no_borrow_wait_l3', 'no_c3_wait',
@@ -1551,12 +1565,49 @@ def run(mc, control, path, out_dir, untouched, validated=True):
         orig_init = Borrowed.__init__
         def bad_init(self, f, *args, **kwargs):
             orig_init(self, f, *args, **kwargs)
-            for u, r in list(self.homes.items()):
+            moved = {}
+            new_web_homes = []
+            for u, r, span in self.web_homes:
                 if r + 2 <= self.top + 1:
-                    self.homes[u] = r + 1
-                    self.used.discard(r)
-                    self.used.add(r + 1)
+                    r2 = r + 1
+                    new_web_homes.append((u, r2, span))
+                    for i in span:
+                        self._home_at[i][u] = r2
+                else:
+                    new_web_homes.append((u, r, span))
+            self.web_homes = new_web_homes
+            self.used = {r for _, r, _ in new_web_homes}
         Borrowed.__init__ = bad_init
+    elif control == 'split_home':
+        borrow_saved['__init__'] = Borrowed.__init__
+        orig_init_split = Borrowed.__init__
+        def split_init(self, f, *args, **kwargs):
+            orig_init_split(self, f, *args, **kwargs)
+            for idx, (u, r, span) in enumerate(self.web_homes):
+                if len(span) < 2:
+                    continue
+                readers = [j for j in span if (self._live_in_u[j] >> u & 1) and (self._raw_reads_u[j] >> u & 1)]
+                live_js = readers or [j for j in span if (self._live_in_u[j] >> u & 1)]
+                picked = None
+                for j in live_js:
+                    r2 = next((cand for cand in range(2, self.top + 1) if cand != r and not ((self.busy[j] | self.taken[j]) >> cand & 1)), None)
+                    if r2 is not None:
+                        picked = (j, r2)
+                        break
+                if picked is None:
+                    continue
+                j, r2 = picked
+                self.web_homes[idx] = (u, r, [x for x in span if x != j])
+                self.web_homes.append((u, r2, [j]))
+                self.web_homes.sort(key=lambda item: (item[0], item[1], item[2]))
+                self._home_at[j][u] = r2
+                self.taken[j] |= 1 << r2
+                self.used.add(r2)
+                break
+        Borrowed.__init__ = split_init
+    elif control == 'caller_live_in_callee':
+        borrow_saved['_exact_callee_caller_live'] = Borrowed._exact_callee_caller_live
+        Borrowed._exact_callee_caller_live = False
     elif control == 'no_borrow_wait':
         # Where the first instruction of what an instruction became waits for all six scoreboards
         # (it writes a borrowed register), it waits for what the original waited for only.
@@ -1564,9 +1615,10 @@ def run(mc, control, path, out_dir, untouched, validated=True):
         def no_wait_finish(self):
             if self.borrow is not None:
                 for item in self.items:
-                    if item.first and item.changed and (item.word >> WAIT) & 63 == 63:
+                    if item.first and item.changed and item.borrows:
                         src_wait = (self.src[item.origin].word >> WAIT) & 63
-                        item.word = (item.word & ~(63 << WAIT)) | (src_wait << WAIT)
+                        if (item.word >> WAIT) & 63 != src_wait:
+                            item.word = (item.word & ~(63 << WAIT)) | (src_wait << WAIT)
             return orig_finish_nbw(self)
         originals['finish'] = Function.finish
         Function.finish = no_wait_finish
@@ -1641,12 +1693,15 @@ def run(mc, control, path, out_dir, untouched, validated=True):
         def ignore_taken_pair(self, i, width=1, given=0):
             if width != 2:
                 return orig_pair_ov(self, i, width, given)
-            # Ignore `taken` so the pool may overlap an alive home.
-            held = self.busy[i] | given
-            for r in range(2, self.top + 2 - width, 2):
-                if not held >> r & ((1 << width) - 1):
-                    return r
-            return None
+            # Ignore `taken` so the pool may overlap an alive home, and choose otherwise as the
+            # translator does (its cap, and its preference for registers no late reader or
+            # scoreboard holds): where nothing is taken the control changes nothing.
+            saved = self.taken[i]
+            self.taken[i] = 0
+            try:
+                return orig_pair_ov(self, i, width, given)
+            finally:
+                self.taken[i] = saved
         Borrowed.free_at = ignore_taken_pair
     elif control == 'written_pair':
         borrow_saved['free_at'] = Borrowed.free_at
@@ -1787,14 +1842,13 @@ def run(mc, control, path, out_dir, untouched, validated=True):
                 has_mem = any(w.startswith('mem:') for _, w in parts)
                 if has_mem:
                     continue
-                # Clear the 63-wait from every instruction of this sequence.
+                # Clear any borrow wait from every instruction of this sequence.
                 for new_off, what in sorted(parts):
                     word = int.from_bytes(data[new_off:new_off+16], 'little')
-                    if (word >> WAIT) & 63 == 63:
+                    if (word >> WAIT) & 63 != 0:
                         word &= ~(63 << WAIT)
                         data[new_off:new_off+16] = word.to_bytes(16, 'little')
                         changed = True
-                        break
                 if changed:
                     break
             if changed:
@@ -1962,10 +2016,10 @@ def run(mc, control, path, out_dir, untouched, validated=True):
                 has_mem = any(w.startswith('mem: ') for _, w in parts)
                 if not has_mem:
                     continue
-                # Clear the 63 << WAIT from EVERY instruction of the sequence.
+                # Clear borrowed waits from EVERY instruction of the sequence.
                 for new, w in sorted(parts):
                     word = int.from_bytes(data[new:new + 16], 'little')
-                    if (word >> WAIT) & 63 == 63:
+                    if (word >> WAIT) & 63 != 0:
                         word &= ~(63 << WAIT)
                         data[new:new + 16] = word.to_bytes(16, 'little')
             section.data = bytes(data)

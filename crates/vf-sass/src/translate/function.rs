@@ -378,7 +378,7 @@ pub(super) fn translate_function(
             let mut mine: HashSet<u32> = HashSet::new();
             for &(l, u) in &d.writes {
                 if l == LETTER_U
-                    && let Some(&r) = borrow.homes.get(&u)
+                    && let Some(r) = borrow.home_at(i, u)
                 {
                     mine.insert(r);
                 }
@@ -389,7 +389,7 @@ pub(super) fn translate_function(
             }
             mine.extend(&at_instr);
             if !mine.is_empty() {
-                around[0].word |= 63u128 << WAIT;
+                around[0].borrow_wait = true;
                 for item in &mut around {
                     item.borrows.clone_from(&mine);
                 }
@@ -456,18 +456,22 @@ pub(super) fn translate_function(
     if let Some(ref borrow) = ctx.borrow
         && !borrow.used.is_empty()
     {
-        let used = &borrow.used;
+        let mut used_bits = super::regset_empty();
+        for &r in &borrow.used {
+            if r < 255 {
+                super::regset_set(&mut used_bits, r);
+            }
+        }
         for item in &mut items {
-            let d70 = ctx.dec70.decode(item.word);
-            let Some(ref d70) = d70 else { continue };
+            let Some(d70) = ctx.dec70.decode(item.word) else {
+                continue;
+            };
             let board = ((item.word >> WRITE_BARRIER) & 7) as u32;
-            let written: HashSet<u32> = d70
+            let writes_used = d70
                 .writes
                 .iter()
-                .filter(|&&(l, _)| l == LETTER_R)
-                .map(|&(_, r)| r)
-                .collect();
-            if !written.is_disjoint(used) && unannounced(d70) && !item.covered {
+                .any(|&(l, r)| l == LETTER_R && r < 255 && super::regset_test(&used_bits, r));
+            if writes_used && unannounced(&d70) && !item.covered {
                 // Borrowed leaves out the registers the program writes so; this is for
                 // what the translation made of an instruction. A covered instruction is
                 // part of a sequence whose later instruction says when the result is there,
@@ -477,7 +481,13 @@ pub(super) fn translate_function(
                     16 * item.origin
                 )));
             }
-            if board != 7 && !written.is_disjoint(&item.borrows) {
+            if board != 7
+                && !item.borrows.is_empty()
+                && d70
+                    .writes
+                    .iter()
+                    .any(|&(l, r)| l == LETTER_R && item.borrows.contains(&r))
+            {
                 // A result of the translation that is written when it arrives, in a register
                 // the program may write next: the next instruction waits until it is there.
                 item.also.push(board);
@@ -485,14 +495,22 @@ pub(super) fn translate_function(
             // An instruction that reads a borrowed register some time after it is issued,
             // for the program: it says on a scoreboard when it has read, so that what the
             // translation writes there next, which waits for every scoreboard, comes after.
+            let mut word_changed = false;
             if !item.late
                 && d70.kind.is_late()
                 && ((item.word >> READ_BARRIER) & 7) == 7
-                && d70.reads.iter().any(|&(l, r, _)| l == LETTER_R && used.contains(&r))
+                && d70
+                    .reads
+                    .iter()
+                    .any(|&(l, r, _)| l == LETTER_R && r < 255 && super::regset_test(&used_bits, r))
                 && let Ok(w) = read_announced(d70.name, unmarked(d70.name, item.word, item.what), item.origin)
             {
                 item.word = w;
                 item.says = true;
+                word_changed = true;
+            }
+            if !word_changed {
+                item.d = Some(d70);
             }
         }
     }
@@ -508,26 +526,119 @@ pub(super) fn translate_function(
             }
             if let Some(board) = items[k].then {
                 items[k + 1].word |= 1u128 << (WAIT + board);
+                items[k + 1].d = None;
             }
             for &board in &items[k].also.clone() {
                 items[k + 1].word |= 1u128 << (WAIT + board);
+                items[k + 1].d = None;
             }
         }
     }
 
-    // Decode all items as sm_70
+    // Decode any items whose word was modified or not yet decoded as sm_70
     for item in &mut items {
-        item.d = Some(match ctx.dec70.decode(item.word) {
-            Some(d) => d,
-            None => {
-                return Err(Refused(format!(
-                    "the translation of the instruction at 0x{:x} ({}) is not an sm_70 instruction: {:032x}",
-                    16 * item.origin,
-                    fd.src[item.origin].name,
-                    item.word
-                )));
+        if item.d.is_none() {
+            item.d = Some(match ctx.dec70.decode(item.word) {
+                Some(d) => d,
+                None => {
+                    return Err(Refused(format!(
+                        "the translation of the instruction at 0x{:x} ({}) is not an sm_70 instruction: {:032x}",
+                        16 * item.origin,
+                        fd.src[item.origin].name,
+                        item.word
+                    )));
+                }
+            });
+        }
+    }
+
+    // Borrowed registers: wait only on the scoreboards that any instruction of the function
+    // writes or late-reads those registers on (avoiding unrelated high-latency stalls).
+    if ctx.borrow.is_some() && items.iter().any(|item| item.borrow_wait) {
+        let mut boards_of = [0u8; 256];
+        for item in &items {
+            let wb = ((item.word >> WRITE_BARRIER) & 7) as u32;
+            let rb = ((item.word >> READ_BARRIER) & 7) as u32;
+            let d70 = item.d.as_ref().unwrap();
+            if wb < 7 {
+                let bit = 1u8 << wb;
+                for &(l, r) in &d70.writes {
+                    if l == LETTER_R && r < 255 {
+                        boards_of[r as usize] |= bit;
+                    }
+                }
+                if item.origin < fd.src.len() {
+                    for &(l, r) in &fd.src[item.origin].writes {
+                        if l == LETTER_R && r < 255 {
+                            boards_of[r as usize] |= bit;
+                        }
+                    }
+                }
             }
-        });
+            if !item.late && !matches!(item.what, "on the sum" | "on the uniform part" | "on the product") && rb < 7 {
+                let bit = 1u8 << rb;
+                for &(l, r, _) in &d70.reads {
+                    if l == LETTER_R && r < 255 {
+                        boards_of[r as usize] |= bit;
+                    }
+                }
+            }
+        }
+        for item in &mut items {
+            if item.borrow_wait {
+                let mut mask = 0u8;
+                for &r in &item.borrows {
+                    if r < 255 {
+                        mask |= boards_of[r as usize];
+                    }
+                }
+                if mask != 0 {
+                    item.word |= u128::from(mask) << WAIT;
+                    item.d = ctx.dec70.decode(item.word);
+                }
+            }
+        }
+    }
+
+    if let Some(b) = ctx.borrow.as_ref()
+        && !b.used.is_empty()
+    {
+        for k in 0..items.len() {
+            if items[k].says && !items[k].late {
+                let rb = ((items[k].word >> READ_BARRIER) & 7) as u32;
+                let wb = ((items[k].word >> WRITE_BARRIER) & 7) as u32;
+                if rb != 7 {
+                    let reads_borrowed: Vec<u32> = items[k]
+                        .d
+                        .as_ref()
+                        .unwrap()
+                        .reads
+                        .iter()
+                        .filter_map(|&(l, r, _)| (l == LETTER_R && b.used.contains(&r)).then_some(r))
+                        .collect();
+                    if !reads_borrowed.is_empty() {
+                        for item_j in &mut items[k + 1..] {
+                            let wait_mask = (item_j.word >> WAIT) & 63;
+                            if ((wait_mask >> rb) & 1 != 0) || (wb != 7 && ((wait_mask >> wb) & 1 != 0)) {
+                                break;
+                            }
+                            let d_next = item_j.d.as_ref().unwrap();
+                            if d_next.kind == crate::decode::Kind::BRU {
+                                break;
+                            }
+                            if d_next
+                                .writes
+                                .iter()
+                                .any(|&(l, r)| l == LETTER_R && reads_borrowed.contains(&r))
+                            {
+                                item_j.word |= 1u128 << (WAIT + rb);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     let relocate = return_addresses(&mut items, &targets, fd)?;
@@ -580,11 +691,8 @@ fn lives(
         }
     }
     if let Some(b) = borrow {
-        let mut homes: Vec<(u32, u32)> = b.homes.iter().map(|(&u, &r)| (u, r)).collect();
-        homes.sort_unstable();
-        for (u, r) in homes {
-            let span = b.spans.get(&u).map_or_else(Vec::new, |span| offsets(span));
-            lives.push((i64::from(u), i64::from(r), "home", span));
+        for (u, r, span) in &b.web_homes {
+            lives.push((i64::from(*u), i64::from(*r), "home", offsets(span)));
         }
         let mut given: Vec<_> = given_at.iter().collect();
         given.sort_unstable();

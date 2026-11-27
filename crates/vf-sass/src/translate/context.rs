@@ -99,6 +99,9 @@ impl Ctx<'_> {
         if let Some(&r) = self.mem_regs.get(&u) {
             return Ok(r);
         }
+        if let Some(r) = self.borrow.as_ref().and_then(|b| b.home_at(self.at, u)) {
+            return Ok(r);
+        }
         self.place.get(&u).copied().ok_or_else(|| no_register(u))
     }
     pub(super) fn p(&self, q: u32) -> Result<u32, Refused> {
@@ -322,19 +325,21 @@ impl Ctx<'_> {
         let mut read_set: Vec<u32> = Vec::new();
         let mut written_set: Vec<u32> = Vec::new();
         let mut together: HashSet<u32> = HashSet::new();
+        let b = self.borrow.as_ref().unwrap();
+        let is_slot_here = |x: u32| slots.contains_key(&x) && b.home_at(self.at, x).is_none();
         for &(letter, x, _) in &d.reads {
-            if letter == LETTER_U && x != 63 && slots.contains_key(&x) && !read_set.contains(&x) {
+            if letter == LETTER_U && x != 63 && is_slot_here(x) && !read_set.contains(&x) {
                 read_set.push(x);
             }
         }
         for &(letter, x) in &d.writes {
-            if letter == LETTER_U && x != 63 && slots.contains_key(&x) && !written_set.contains(&x) {
+            if letter == LETTER_U && x != 63 && is_slot_here(x) && !written_set.contains(&x) {
                 written_set.push(x);
             }
         }
-        // Detect pairs: check if the instruction takes a pair operand (count=2) with both in slots.
+        // Detect pairs: check if the instruction takes a pair operand (count=2) unhomed at this insn.
         for (first, count) in crate::decode::uniform_operands(d) {
-            if count == 2 && slots.contains_key(&first) {
+            if count == 2 && is_slot_here(first) {
                 together.insert(first);
             }
         }

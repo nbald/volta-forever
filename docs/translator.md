@@ -447,17 +447,28 @@ max_threads_per_block = min(floor(16384 / (allocated * 32)) * 128, 1024)
 A kernel compiled with 64 registers has max_threads of 1,024. At 65 the
 allocation jumps to 72 and the maximum drops to 896. A kernel launched with
 1,024 threads that now declares more than 64 registers fails with error 701
-("too many resources requested for launch"). With level 0 alone, 1,012 of
-PyTorch's 23,693 functions cross that boundary, and five cases of the operation
-battery cannot be launched (`avg_pool2d`, `interpolate`, `unfold`).
+("too many resources requested for launch"). Kernels also cross narrower
+occupancy tiers (such as 32 -> 40, 40 -> 48, 48 -> 56, 56 -> 64, 64 -> 72,
+or 96 -> 104 registers on GV100, which allocates registers in multiples of 8
+per warp out of a 16,384-register partitioned file); the translator recovers
+the original kernel's occupancy tier for stackless kernels (no local stack
+frame or `LDL`/`STL` memory traffic) whenever borrowing (levels 1 and 2,
+without local-memory spills) can fit within it, using the exact liveness of
+internal `CALL.REL`/`RET.REL` subroutines when calls are traceable. With
+level 0 alone, 1,012 of PyTorch's 23,693 functions cross the 64-register
+boundary, and five cases of the operation battery cannot be launched
+(`avg_pool2d`, `interpolate`, `unfold`).
 
 
 ### Level 1: homes in the program's registers
 
-A uniform register whose value is alive over some instructions may find an
-ordinary register of the program that is neither alive nor written at any of
-those instructions (a "home"). The uniform register lives there instead of above
-the program's registers, adding nothing to the count.
+A uniform register's live range is decomposed into disjoint SSA value-flow
+webs (coupled across any 64-bit pair operands). Each web whose instructions
+all find a free ordinary register of the program — one neither alive nor
+written there, respecting exact `CALL.REL`/`RET.REL` liveness and any late
+read scoreboards (`WAR` hazards) — takes that register as its home instead of
+adding a register above the program's count. Disjoint webs of the same
+uniform register may take different homes.
 
 Tried on every function of PyTorch (an experiment: the default does this only
 for a kernel that would be refused), it brought 35 % of the functions that had
@@ -859,8 +870,8 @@ on a V100 with 510 hand-made sm_70 kernels (three runs each, one warp):
 
 **What this means for borrowed registers.** Before the translation writes into
 a register it borrows, every instruction of the program that wrote that register
-on a scoreboard must have been waited for (the first write waits for all six
-scoreboards). A register that some instruction of the function writes late under
+on a scoreboard must have been waited for (the first write waits for the
+scoreboards that write or late-read that register, rather than all six). A register that some instruction of the function writes late under
 no scoreboard, or by arithmetic on doubles, or by a matrix product, is never
 borrowed: nothing can be waited for, and the distance across a branch is not
 known. On PyTorch, 161 homes fewer of 12,109 (`reference/translate.py`,
