@@ -911,7 +911,9 @@ nvJitLink adapter say, and where.
 `VF_TRANSLATE` (whether machine code is translated, and where PTX or sm_70 code exists too),
 `VF_BORROW` (where the translation of machine code takes the registers it needs:
 `docs/translator.md`, "Registers"), `VF_PAIRS` (pairs of products on whole rows:
-`docs/pairs.md`), `VF_ALIGNED_ROWS` (whether the rows that `ldmatrix` reads are taken to be
+`docs/pairs.md`), `VF_COMPANIONS` (`1`: opt-in companion register hoisting and per-group
+paired HMMA scheduling, off by default: `docs/pairs.md`, sections 8 and 12; turned off by
+`VF_PAIRS=0` and `VF_SAFE=1`), `VF_ALIGNED_ROWS` (whether the rows that `ldmatrix` reads are taken to be
 at multiples of 16 bytes).
 
 For a CUDA graph that fails at instantiation with `CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES`,

@@ -3,6 +3,7 @@
 
 use crate::decode::Decoded;
 use crate::field;
+use crate::generated::classes::{SM75_CLASSES, SM75_OPERANDS, VF_CLASSES, VF_OPERANDS};
 use crate::generated::fields::*;
 use crate::generated::special::*;
 
@@ -15,33 +16,40 @@ pub fn find_relative_decoded(d: &Decoded, sm: u32) -> Option<(u16, u32)> {
     find_relative(d, sm)
 }
 
+#[inline]
 pub(super) fn find_relative(d: &Decoded, sm: u32) -> Option<(u16, u32)> {
-    let (op_types, op_type_offsets) = if sm == 75 {
-        (&SM75_OP_TYPES[..], &SM75_OP_TYPE_OFFSETS[..])
+    let cid = d.class_id as usize;
+    let (name, op_types, op_type_offsets, op_start, op_len, operands) = if sm == 75 {
+        let cls = &SM75_CLASSES[cid];
+        (
+            cls.0,
+            &SM75_OP_TYPES[..],
+            &SM75_OP_TYPE_OFFSETS[..],
+            cls.10 as usize,
+            cls.11 as usize,
+            &SM75_OPERANDS[..],
+        )
     } else {
-        (&VF_OP_TYPES[..], &VF_OP_TYPE_OFFSETS[..])
+        let cls = &VF_CLASSES[cid];
+        (
+            cls.0,
+            &VF_OP_TYPES[..],
+            &VF_OP_TYPE_OFFSETS[..],
+            cls.10 as usize,
+            cls.11 as usize,
+            &VF_OPERANDS[..],
+        )
     };
-    let (off, len) = op_type_offsets[d.class_id as usize];
+    let (off, len) = op_type_offsets[cid];
     let types = &op_types[off as usize..(off as usize + len as usize)];
     // A branch through a register goes to the instruction after it, plus the register, plus a
     // number: minus where that next instruction is, a distance in the code too (to offset 0).
-    let rsimm_nid = if d.name == "brx_" {
+    let rsimm_nid = if name == "brx_" {
         OP_RA_OFFSET
     } else {
         types.iter().find(|&&(_, tc)| tc == 5).map(|&(nid, _)| nid)?
     };
-    let classes = if sm == 75 {
-        &crate::generated::classes::SM75_CLASSES[..]
-    } else {
-        &crate::generated::classes::VF_CLASSES[..]
-    };
-    let operands = if sm == 75 {
-        &crate::generated::classes::SM75_OPERANDS[..]
-    } else {
-        &crate::generated::classes::VF_OPERANDS[..]
-    };
-    let cls = &classes[d.class_id as usize];
-    let ops = &operands[cls.10 as usize..(cls.10 + cls.11) as usize];
+    let ops = &operands[op_start..(op_start + op_len)];
     for &(nid, fid, scale, kind) in ops {
         if nid == rsimm_nid && kind == 2 && scale > 0 {
             return Some((fid, scale as u32));

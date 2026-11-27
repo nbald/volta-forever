@@ -369,6 +369,8 @@ tc groups "$G/k_groups.135.sm75.ptx" "PTX for sm_75 retargeted" "26 kernels, 0 w
 # (p_basic's count says the pairs were made: 234 instructions are added when each product is translated by itself.)
 tc pairs-machine-code "$G/k_pairs.135.sm75.cubin" "machine code for sm_75 translated \(12 functions\)" "1 of these functions is not translated" \
     "emulated in p_basic: 91 instructions added in translated machine code" "34 kernels, 0 wrong"
+VF_COMPANIONS=1 tc pairs-machine-code-companions "$G/k_pairs.135.sm75.cubin" "machine code for sm_75 translated \(12 functions\)" "1 of these functions is not translated" \
+    "emulated in p_basic: 93 instructions added in translated machine code" "34 kernels, 0 wrong"
 tc pairs "$G/k_pairs.135.sm75.ptx" "PTX for sm_75 retargeted" "37 kernels, 0 wrong"
 # The same machine code with each product translated by itself (VF_PAIRS=0), as it was before
 # pairs were the default: that path stays in use where a function has no register left for pairs.

@@ -7,9 +7,9 @@
 # Without CUBIN: the sm_75 cubins of tests/kernels; some of PyTorch's when they are where `TORCH`
 # says (tests/sass/compare.sh), and six of the held-out corpus when it is where `HELDOUT` says
 # (the directory given to tests/sass/heldout-extract.sh): the ones named below have what the
-# controls take away. Five passes, because a control needs a translation that has what it takes
+# controls take away. Six passes, because a control needs a translation that has what it takes
 # away:
-#   the default           every control
+#   the default           every control (but companions)
 #   VF_BORROW=1         the controls of borrowed registers (every function borrows)
 #   VF_BORROW=8         the controls of the frame, of products at level 3, and those of matrix
 #                         sequences again (level 3 everywhere)
@@ -18,6 +18,7 @@
 #   VF_BORROW=3         the controls of the base of the frame (the frame addressed from its
 #                         top, which a register is loaded with: elsewhere these kernels have
 #                         their frame under the stack pointer)
+#   VF_COMPANIONS=1     the controls of companions (address shuffles hoisted out of loops)
 # In each pass one process validates the translation as it is, and the others take it unvalidated.
 # OUT gets one file a pass and control (what controls.py printed), and `summary.tsv`: for each
 # control, in how many cubins it changed the translation, in how many of those the validator
@@ -66,11 +67,12 @@ python3 -I - "$W/reference" "$out/of-the-program" > "$out/todo" <<'PY'
 import sys
 sys.path.insert(0, sys.argv[1])
 import controls as c
-passes = [('default', [x for x in c.CONTROLS if x != 'as it is']),
+passes = [('default', [x for x in c.CONTROLS if x != 'as it is' and x not in c.COMPANION_CONTROLS]),
           ('1', c.BORROW_CONTROLS),
           ('8', c.FRAME_CONTROLS + c.PRODUCT_L3_CONTROLS + ['unguarded', 'lanes', 'unwaited', 'unordered', 'soon']),
           ('5', c.ROOM_CONTROLS + c.FRAME_CONTROLS),
-          ('3', c.BASE_CONTROLS)]
+          ('3', c.BASE_CONTROLS),
+          ('companions', c.COMPANION_CONTROLS)]
 for name, controls in passes:
     print(name, 'as-it-is')
 for name, controls in passes:
@@ -82,7 +84,9 @@ export W out
 one() {
     local pass=$1 name=$2 cubins
     mapfile -t cubins < "$out/cubins"
-    if [ "$pass" = default ]; then unset VF_BORROW; else export VF_BORROW=$pass; fi
+    if [ "$pass" = default ]; then unset VF_BORROW VF_COMPANIONS
+    elif [ "$pass" = companions ]; then unset VF_BORROW; export VF_COMPANIONS=1
+    else unset VF_COMPANIONS; export VF_BORROW=$pass; fi
     if [ "$name" = as-it-is ]; then python3 -I "$W/reference/controls.py" -c 'as it is' "${cubins[@]}"
     else python3 -I "$W/reference/controls.py" -u -c "$name" "${cubins[@]}"; fi > "$out/$pass.$name.txt" 2>&1
 }

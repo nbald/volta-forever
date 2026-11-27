@@ -15,6 +15,7 @@ mod function;
 mod instruction;
 mod liveness;
 mod matrix;
+mod parallel;
 mod parse;
 mod return_addr;
 mod schedule;
@@ -23,7 +24,8 @@ mod util;
 #[cfg(test)]
 mod tests;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::decode::{Decoded, Kind};
 use crate::generated::fields::*;
@@ -31,7 +33,7 @@ use crate::generated::special::*;
 
 pub use self::util::find_relative_decoded;
 pub use ampere::{Word as AmpereWord, described as ampere_class, word as ampere_word};
-pub use cubin::{translate, translate_with_options};
+pub use cubin::{translate, translate_with_companions, translate_with_options};
 
 // ---- Error type ----
 #[derive(Debug)]
@@ -51,18 +53,18 @@ struct Item {
     first: bool,
     target: Option<u64>,
     fix: Option<u64>,
-    d: Option<Decoded>,
+    d: Option<Arc<Decoded>>,
     /// It reads, some time after it is issued, registers the translation gave it (`late`).
     late: bool,
     /// A scoreboard that the instruction after it waits for.
     then: Option<u32>,
     /// Other scoreboards the next instruction waits for (borrowed registers: a late result of
     /// the translation in a register the program may write next).
-    also: Vec<u32>,
+    also_mask: u8,
     /// An instruction of the program made to say when it has read (borrowed registers).
     says: bool,
     /// The borrowed registers that the sequence it is part of writes for the translation.
-    borrows: HashSet<u32>,
+    borrows: Option<Box<RegSet>>,
     /// Its result is waited for with that of a later instruction of its sequence: the schedule
     /// treats it like a writer that names a scoreboard.
     covered: bool,
@@ -90,9 +92,9 @@ impl Item {
             d: None,
             late: false,
             then: None,
-            also: Vec::new(),
+            also_mask: 0,
             says: false,
-            borrows: HashSet::new(),
+            borrows: None,
             covered: false,
             anew: false,
             more_reads: Vec::new(),
@@ -170,6 +172,8 @@ const AROUND: &[&str] = &[
     "settled",
     "to pairs",
     "from pairs",
+    "companion",
+    "companion: lane",
 ];
 /// The relocations that write the lower and the upper half of an address into the 32 bits of an
 /// immediate (R_CUDA_ABS32_LO_32, R_CUDA_ABS32_HI_32).
@@ -246,7 +250,7 @@ fn with_stall(word: u128, stall: u32, marks: bool) -> u128 {
 }
 
 /// The decoded instruction has operands that can bear a mark of register reuse.
-fn marked(d: &Option<Decoded>) -> bool {
+fn marked(d: &Option<Arc<Decoded>>) -> bool {
     d.as_ref().is_some_and(|d| {
         d.ops
             .iter()
@@ -305,6 +309,9 @@ pub struct Options {
     pub pairs: bool,
     /// Whether the rows of a matrix load are taken to be aligned on 16 bytes (VF_ALIGNED_ROWS).
     pub aligned_rows: bool,
+    /// Opt-in companion registers for whole-row matrix load addresses and per-group pair
+    /// scheduling (`VF_COMPANIONS=1`; off by default, and unused when `pairs` is false).
+    pub companions: bool,
     /// Whether the translation looks for room in the program's own registers before it takes new
     /// ones. 0: off. 1: homes and pool (levels 2, 1, 0). 2: and, for a kernel refused even so,
     /// everything at the instruction (level 3). 3: level 3 first, for tests. 4: by a kernel's
@@ -330,13 +337,14 @@ impl Default for Options {
         Self {
             pairs: true,
             aligned_rows: true,
+            companions: false,
             borrow: BORROW_DEFAULT,
         }
     }
 }
 
 impl Options {
-    /// Read `VF_PAIRS`, `VF_ALIGNED_ROWS` and `VF_BORROW` from the environment.
+    /// Read `VF_PAIRS`, `VF_ALIGNED_ROWS`, `VF_COMPANIONS` and `VF_BORROW` from the environment.
     pub fn from_environment() -> Self {
         let mut opts = Self::default();
         if let Ok(v) = std::env::var("VF_PAIRS") {
@@ -344,6 +352,9 @@ impl Options {
         }
         if let Ok(v) = std::env::var("VF_ALIGNED_ROWS") {
             opts.aligned_rows = v != "0";
+        }
+        if let Ok(v) = std::env::var("VF_COMPANIONS") {
+            opts.companions = v == "1";
         }
         opts.borrow = borrow_from(std::env::var("VF_BORROW").ok().as_deref());
         opts

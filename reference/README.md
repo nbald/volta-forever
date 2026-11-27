@@ -20,7 +20,7 @@ architecture. Run them with `python3 -I`.
 |---|---|
 | `md.py` | The descriptions read into classes (format, opcode, fields); `Decoder`: the class of an instruction word and its operands |
 | `elf.py` | The container read and written back (byte for byte when nothing changed) |
-| `machine.py`, `translate.py IN OUT [MAP]` | The reference translator; with MAP, it writes `MAP.lives` beside it, for `validate.py` (as `vf translate` does). `VF_BORROW`, `VF_PAIRS`, `VF_ALIGNED_ROWS` as in the layer; `VF_BORROW_SAY=1` says what it borrowed, `VF_PAIRS_SAY=1` where it gives pairs up; `VF_COMPANIONS=1` is an experiment of this translator only (`docs/pairs.md`, section 12) |
+| `machine.py`, `translate.py IN OUT [MAP]` | The reference translator; with MAP, it writes `MAP.lives` beside it, for `validate.py` (as `vf translate` does). `VF_BORROW`, `VF_PAIRS`, `VF_COMPANIONS` (`0` by default, `1` opt-in), `VF_ALIGNED_ROWS` as in the layer; `VF_BORROW_SAY=1` says what it borrowed, `VF_PAIRS_SAY=1` where it gives pairs up (`docs/pairs.md`, section 12) |
 | `pairing.py CUBIN...` | The plan of pairs of products on whole rows for each function (`docs/pairs.md`, section 11): which loads, which products, which conversions where; printed |
 | `batch.py OUT_DIR CUBIN...` | The translator on many cubins in one process (what `tests/sass/compare.sh` compares with) |
 | `ampere.py` | Checks and lowers supported sm80 instructions before the ordinary Turing-to-Volta translation. |

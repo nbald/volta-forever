@@ -4,6 +4,8 @@
 //! Sections whose size changed move what follows them. This is a faithful port of
 //! `reference/elf.py`.
 
+use crate::fast::FastMap;
+
 const SHT_NULL: u32 = 0;
 const SHT_SYMTAB: u32 = 2;
 const SHT_NOBITS: u32 = 8;
@@ -207,6 +209,16 @@ impl Elf {
     /// Find a section by name.
     pub fn section(&self, name: &str) -> Option<usize> {
         self.sections.iter().position(|s| s.name == name)
+    }
+
+    /// Map each section name to its first section index.
+    #[allow(dead_code)]
+    pub(crate) fn section_index_map(&self) -> FastMap<&str, usize> {
+        let mut map = FastMap::with_capacity_and_hasher(self.sections.len(), Default::default());
+        for (i, s) in self.sections.iter().enumerate() {
+            map.entry(s.name.as_str()).or_insert(i);
+        }
+        map
     }
 
     /// Read the symbol table.

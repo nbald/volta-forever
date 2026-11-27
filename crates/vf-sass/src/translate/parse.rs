@@ -91,13 +91,24 @@ pub(super) fn parse_function(
     if !code.len().is_multiple_of(16) {
         return Err(Refused("code that is not a whole number of instructions".into()));
     }
-    let words: Vec<u128> = (0..code.len() / 16)
-        .map(|i| u128::from_le_bytes(code[i * 16..(i + 1) * 16].try_into().unwrap()))
-        .collect();
-    let mut src = Vec::with_capacity(words.len());
-    for (i, &w) in words.iter().enumerate() {
-        match dec75.decode(w) {
-            Some(d) => src.push(d),
+    let insn_count = code.len() / 16;
+    let mut src = Vec::with_capacity(insn_count);
+    let mut uniform_mask: u64 = 0;
+    let mut extra_uniform: Vec<u32> = Vec::new();
+    let mut pairs_mask: u64 = 0;
+    let mut extra_pairs: Vec<u32> = Vec::new();
+    let mut unif_pred_mask: u64 = 0;
+    let mut extra_unif_pred: Vec<u32> = Vec::new();
+    let mut needs_pool = false;
+    let mut highest: u32 = 0;
+    let mut needs_lane = false;
+    let mut product_count: u32 = 0;
+    let mut bad_count: Option<u32> = None;
+
+    for (i, &chunk) in code.as_chunks::<16>().0.iter().enumerate() {
+        let w = u128::from_le_bytes(chunk);
+        let d = match dec75.decode_arc(w) {
+            Some(arc) => (*arc).clone(),
             None => {
                 return Err(Refused(format!(
                     "the instruction {:032x} at 0x{:x} is not one of the sm_75 description",
@@ -105,74 +116,99 @@ pub(super) fn parse_function(
                     16 * i
                 )));
             }
-        }
-    }
-
-    let mut uniform_set: Vec<u32> = Vec::new();
-    let mut pairs: Vec<u32> = Vec::new();
-    let mut needs_pool = false;
-    for d in &src {
-        for (first, count) in crate::decode::uniform_operands(d) {
+        };
+        crate::decode::for_each_uniform_operand(&d, |first, count| {
             for r in first..first + count {
-                if r != 63 && !uniform_set.contains(&r) {
-                    uniform_set.push(r);
+                if r != 63 {
+                    if r < 64 {
+                        uniform_mask |= 1u64 << r;
+                    } else if !extra_uniform.contains(&r) {
+                        extra_uniform.push(r);
+                    }
                 }
             }
             match count {
                 1 => {}
                 2 => {
-                    if !pairs.contains(&first) {
-                        pairs.push(first);
+                    if first < 64 {
+                        pairs_mask |= 1u64 << first;
+                    } else if !extra_pairs.contains(&first) {
+                        extra_pairs.push(first);
                     }
                 }
-                _ => return Err(Refused(format!("a uniform operand of {count} registers"))),
+                _ => {
+                    if bad_count.is_none() {
+                        bad_count = Some(count);
+                    }
+                }
             }
-        }
+        });
+        // (A uniform operand of another size is refused once every word is known to decode:
+        // a word that does not is the reason first, as `reference/translate.py` has it.)
         let name = d.name;
-        if name.starts_with("imad_hi__")
-            || (STRIDED.contains(&name) && d.op_or(OP_STRIDE, 0) != 0)
-            || (UNIFORM_ADDRESS.iter().any(|(prefix, _)| name.starts_with(prefix)) && d.op_or(OP_RA, 255) != 255)
+        if !needs_pool
+            && (name.starts_with("imad_hi__")
+                || (STRIDED.contains(&name) && d.op_or(OP_STRIDE, 0) != 0)
+                || (UNIFORM_ADDRESS.iter().any(|(prefix, _)| name.starts_with(prefix)) && d.op_or(OP_RA, 255) != 255))
         {
             needs_pool = true;
         }
-    }
-    uniform_set.sort_unstable();
-    pairs.sort_unstable();
-
-    let mut unif_pred: Vec<u32> = Vec::new();
-    for d in &src {
         for &(letter, reg, _) in &d.reads {
-            if letter == LETTER_Q && reg != ZERO_Q && !unif_pred.contains(&reg) {
-                unif_pred.push(reg);
+            if letter == LETTER_Q && reg != ZERO_Q {
+                if reg < 64 {
+                    unif_pred_mask |= 1u64 << reg;
+                } else if !extra_unif_pred.contains(&reg) {
+                    extra_unif_pred.push(reg);
+                }
+            } else if letter == LETTER_R && reg > highest {
+                highest = reg;
             }
         }
         for &(letter, reg) in &d.writes {
-            if letter == LETTER_Q && reg != ZERO_Q && !unif_pred.contains(&reg) {
-                unif_pred.push(reg);
+            if letter == LETTER_Q && reg != ZERO_Q {
+                if reg < 64 {
+                    unif_pred_mask |= 1u64 << reg;
+                } else if !extra_unif_pred.contains(&reg) {
+                    extra_unif_pred.push(reg);
+                }
+            } else if letter == LETTER_R && reg > highest {
+                highest = reg;
             }
         }
+        if is_matrix(name) {
+            needs_lane = true;
+            if name == "hmma_x8_" {
+                product_count += 1;
+            }
+        }
+        src.push(d);
     }
-    unif_pred.sort_unstable();
+    if let Some(count) = bad_count {
+        return Err(Refused(format!("a uniform operand of {count} registers")));
+    }
 
-    let highest = src
-        .iter()
-        .flat_map(|d| {
-            d.reads
-                .iter()
-                .filter(|&&(l, _, _)| l == LETTER_R)
-                .map(|&(_, r, _)| r)
-                .chain(d.writes.iter().filter(|&&(l, _)| l == LETTER_R).map(|&(_, r)| r))
-        })
-        .max()
-        .unwrap_or(0);
+    let collect_mask = |mut mask: u64, extra: &mut Vec<u32>| -> Vec<u32> {
+        let mut out = Vec::with_capacity(mask.count_ones() as usize + extra.len());
+        while mask != 0 {
+            let bit = mask.trailing_zeros();
+            out.push(bit);
+            mask &= mask - 1;
+        }
+        if !extra.is_empty() {
+            extra.sort_unstable();
+            out.extend_from_slice(extra);
+        }
+        out
+    };
+    let uniform_set = collect_mask(uniform_mask, &mut extra_uniform);
+    let pairs = collect_mask(pairs_mask, &mut extra_pairs);
+    let unif_pred = collect_mask(unif_pred_mask, &mut extra_unif_pred);
 
     // Turing's matrix instructions become sequences that go by the lane of the thread, read
     // once when the function is entered, and compute into registers of their own. With a
     // product, four values made of the lane are computed there too (`kept`), and four
     // registers keep the elements of B that the last product gathered.
-    let needs_lane = src.iter().any(|d| is_matrix(d.name));
     let scratch_need = if needs_lane { MATRIX_SCRATCH } else { 0 };
-    let product_count = src.iter().filter(|d| d.name == "hmma_x8_").count() as u32;
 
     Ok(FuncData {
         name: name.to_string(),
@@ -215,6 +251,7 @@ pub(super) type Placement = (
     u32,
     HashMap<u32, u32>,          // rows_at
     HashMap<&'static str, u32>, // kept_rows
+    HashMap<u32, u32>,          // comp_at
     HashMap<u32, u32>,          // hold_at
 );
 
@@ -230,6 +267,7 @@ pub(super) fn placement(
     product: bool,
     rows: Option<&std::collections::BTreeMap<u32, u32>>,
     row_kept: &[&'static str],
+    companions: Option<&std::collections::BTreeMap<u32, u32>>,
     held: &[u32],
 ) -> Result<Placement, Refused> {
     if pairs.iter().any(|u| pairs.contains(&(u + 1))) {
@@ -320,6 +358,13 @@ pub(super) fn placement(
             free += count;
         }
     }
+    let mut comp_at = HashMap::new();
+    if let Some(companions) = companions {
+        for (&root, &count) in companions {
+            comp_at.insert(root, free);
+            free += count;
+        }
+    }
     if free > 253 {
         // The register count is two more than the registers used, and has eight bits.
         return Err(Refused("more registers than there are".into()));
@@ -335,6 +380,7 @@ pub(super) fn placement(
         free,
         rows_at,
         kept_rows,
+        comp_at,
         hold_at,
     ))
 }

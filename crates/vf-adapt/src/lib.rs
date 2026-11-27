@@ -105,6 +105,12 @@ pub struct Policy {
     /// (`VF_PAIRS=0`: they are not, nor in safe mode). The same variable sets `lowering.pairs`, the
     /// pairs of the program-text lowering.
     pub pairs: bool,
+    /// Opt-in companion register hoisting and per-group HMMA scheduling (`VF_COMPANIONS=1`, off by
+    /// default): hoists loop-invariant whole-row load addresses into companion registers, assigns
+    /// per-group scoreboards from 0..4 to interfering pairs, and marks paired `HMMA.884` steps
+    /// with `usched=18` and `.reuse` (`docs/pairs.md`, sections 8 and 12). Unused when `pairs` is
+    /// false, and turned off in safe mode (`make_safe`).
+    pub companions: bool,
     /// Where the translation of machine code takes its registers (`VF_BORROW`; the values are
     /// those of `vf_sass::translate::Options::borrow`). The default, 7: above the program's
     /// wherever that translates, and for a kernel refused for want of registers, among the
@@ -264,6 +270,7 @@ impl Default for Policy {
             told_sm: None,
             translate: Translate::WithoutPtx,
             pairs: true,
+            companions: false,
             borrow: vf_sass::translate::BORROW_DEFAULT,
             keep_sources: false,
             safe: false,
@@ -467,7 +474,9 @@ impl Policy {
     /// a value that is not one, or is below 7.0, is not used (`requested_capability`).
     /// `VF_TRANSLATE=0`: do not translate machine code; `VF_TRANSLATE=first`: translate it also
     /// where an image has PTX (`Translate`). `VF_PAIRS=0`: compute every tensor-core product by
-    /// itself, in machine code (`pairs`) and in program text (`lowering.pairs`). `VF_SAFE=1`: what
+    /// itself, in machine code (`pairs`) and in program text (`lowering.pairs`). `VF_COMPANIONS=1`:
+    /// hoist loop-invariant whole-row load addresses into companion registers and enable per-group
+    /// paired HMMA scheduling (`companions`; off by default, unused when `VF_PAIRS=0`). `VF_SAFE=1`: what
     /// these ask for whose results are not bit-identical to the default's is not used, nor the pairs
     /// of machine code (`make_safe`). `VF_REPORTED_TRAPS=0` (that value only: any other leaves it
     /// on): no instruction is replaced by a reported trap (`lowering.reported_traps`): the functions
@@ -540,6 +549,10 @@ impl Policy {
         if matches!(self.translate, Translate::First | Translate::Force) {
             self.translate = Translate::WithoutPtx;
         }
+        if self.companions {
+            self.companions = false;
+            turned_off.push("VF_COMPANIONS=1");
+        }
         if self.pairs {
             self.pairs = false;
             turned_off.push("VF_PAIRS in machine code");
@@ -587,6 +600,9 @@ impl Policy {
         if let Ok(value) = std::env::var("VF_PAIRS") {
             self.pairs = value != "0";
             self.lowering.pairs = self.pairs;
+        }
+        if let Ok(value) = std::env::var("VF_COMPANIONS") {
+            self.companions = value == "1";
         }
         if let Ok(value) = std::env::var("VF_BORROW") {
             self.borrow = vf_sass::translate::borrow_from(Some(&value));
@@ -715,6 +731,7 @@ impl Policy {
         let opts = vf_sass::translate::Options {
             pairs: self.pairs,
             aligned_rows: self.lowering.aligned_rows,
+            companions: self.companions,
             borrow: self.borrow,
         };
         let translated = vf_sass::translate::translate_with_options(cubin, false, &opts)?;
@@ -3498,13 +3515,14 @@ mod tests {
             policy
         };
         // Each switch whose results are not bit-identical to the default's: put back, and named.
-        let changing: [(&str, Change); 6] = [
+        let changing: [(&str, Change); 7] = [
             ("VF_BF16_TC_GROUPS=1", &|p| p.lowering.bf16_tc_groups = true),
             ("VF_BF16_TC_TILES=1", &|p| p.lowering.bf16_tc_tiles = true),
             ("VF_BF16_COLUMN=tree", &|p| p.lowering.bf16_column = Bf16Column::Tree),
             ("VF_BF16_ROW=tree", &|p| p.lowering.bf16_row = Bf16Row::Tree),
             ("VF_TRANSLATE=first", &|p| p.translate = Translate::First),
             ("VF_TRANSLATE=force", &|p| p.translate = Translate::Force),
+            ("VF_COMPANIONS=1", &|p| p.companions = true),
         ];
         for (name, change) in changing {
             let mut policy = with(change);
@@ -3519,8 +3537,9 @@ mod tests {
             p.lowering.bf16_column = Bf16Column::Tree;
             p.lowering.bf16_row = Bf16Row::Tree;
             p.translate = Translate::Force;
+            p.companions = true;
         });
-        assert_eq!(all.make_safe().len(), 6);
+        assert_eq!(all.make_safe().len(), 7);
         assert_eq!(format!("{all:?}"), format!("{safe_default:?}"));
         // With VF_PAIRS=0 there is nothing to turn off, and it stays as it is.
         let mut unpaired = with(&|p| {
@@ -3601,6 +3620,42 @@ mod tests {
         unpaired.lowering.pairs = false;
         assert_ne!(text(&Policy::default()), text(&unpaired));
         assert_eq!(text(&safe), text(&Policy::default()));
+    }
+
+    #[test]
+    fn policy_companions_is_opt_in_and_respects_unpaired_and_safe() {
+        let cubin = include_bytes!("../../../tests/kernels/k_pairs.135.sm75.cubin");
+        let standalone = include_bytes!("../../../tests/kernels/k_tensor.135.sm75.cubin");
+        let default = Policy::default();
+        assert!(!default.companions);
+        let with_comp = Policy {
+            companions: true,
+            ..default
+        };
+        let image = |policy: &Policy, bytes: &[u8]| policy.adapt_cubin(bytes).image.unwrap();
+        assert_ne!(image(&default, cubin), image(&with_comp, cubin));
+        // Standalone products (no pairs) are untouched whether companions are on or off.
+        assert_eq!(image(&default, standalone), image(&with_comp, standalone));
+
+        let unpaired = Policy {
+            pairs: false,
+            ..default
+        };
+        let unpaired_comp = Policy {
+            companions: true,
+            ..unpaired
+        };
+        assert_eq!(image(&unpaired, cubin), image(&unpaired_comp, cubin));
+        assert_eq!(image(&unpaired, standalone), image(&unpaired_comp, standalone));
+
+        let mut safe = default;
+        safe.make_safe();
+        let mut safe_comp = with_comp;
+        let turned_off = safe_comp.make_safe();
+        assert_eq!(turned_off, vec!["VF_COMPANIONS=1", "VF_PAIRS in machine code"]);
+        assert!(!safe_comp.companions);
+        assert_eq!(image(&safe, cubin), image(&safe_comp, cubin));
+        assert_eq!(image(&safe, cubin), image(&unpaired, cubin));
     }
 
     #[test]

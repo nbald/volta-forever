@@ -106,7 +106,7 @@ MAP gets one line per instruction of the result (function, new offset, old
 offset, what was done), and `MAP.lives` beside it what `reference/validate.py`
 reads with the map (where the uniform predicates live, what was borrowed where),
 as `reference/translate.py` writes them. REPORT gets one line per function
-(`ok`, or why it was refused). `VF_BORROW`, `VF_PAIRS` and `VF_ALIGNED_ROWS`
+(`ok`, or why it was refused). `VF_BORROW`, `VF_PAIRS`, `VF_COMPANIONS` and `VF_ALIGNED_ROWS`
 apply as in the layer.
 
 
@@ -773,7 +773,10 @@ which products may be paired, where a conversion may stand, the schedule.
 
 The planner (`reference/pairing.py`, `crates/vf-sass/src/pairing.rs`)
 identifies which products form pairs and which matrix loads provide their
-operands; `VF_PAIRS=0` turns pairs off. An independent checker
+operands; `VF_PAIRS=0` turns pairs off, and opt-in `VF_COMPANIONS=1` (off by
+default) hoists loop-invariant load addresses into companion registers and uses
+per-group disjoint HMMA scoreboards with `usched=18` and `.reuse` on paired
+`HMMA.884` steps (`docs/pairs.md`, sections 8 and 12). An independent checker
 (`reference/qcheck.py`, `reference/qflow.py`) verifies every plan against the
 design's conditions: the pairs' conditions, who reads what a load gives, the
 states of the accumulators on every path, the places that are whole, the sharing

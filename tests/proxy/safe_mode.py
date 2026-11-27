@@ -114,6 +114,7 @@ ELF75_PTX75 = W / "crates" / "vf-fatbin" / "tests" / "data" / "elf75-ptx75-zstd.
 ELF70_ELF75_PTX70 = W / "crates" / "vf-fatbin" / "tests" / "data" / "elf70-elf75-ptx70-lz4.fatbin"
 CUBIN = W / "tests" / "kernels" / "k_fit_test.135.sm75.cubin"
 PAIRED = W / "tests" / "kernels" / "k_pair_bits.135.sm75.cubin"
+K_PAIRS = W / "tests" / "kernels" / "k_pairs.135.sm75.cubin"
 MACHINE_PAIRS = "VF_PAIRS in machine code"
 
 checks = wrong = 0
@@ -178,7 +179,7 @@ def images(proxy):
 
     # Every switch at once: one line, which names each.
     switches = {"VF_BF16_TC_GROUPS": "1", "VF_BF16_TC_TILES": "1", "VF_BF16_COLUMN": "tree", "VF_BF16_ROW": "tree",
-                "VF_TRANSLATE": "first"}
+                "VF_TRANSLATE": "first", "VF_COMPANIONS": "1"}
     group_default, _ = proxy.run(GROUP)
     safe, said = proxy.run(GROUP, dict(switches, VF_SAFE="1"))
     check("every switch with VF_SAFE=1: the default's text", safe == group_default)
@@ -241,6 +242,23 @@ def images(proxy):
     notsafe, said = proxy.run(PAIRED, {"VF_SAFE": "true"})
     check(f"{PAIRED.name}: VF_SAFE='true' keeps the pairs", notsafe == paired)
 
+    # Opt-in VF_COMPANIONS=1 (companion hoisting + per-group paired HMMA scheduling): off by
+    # default; with VF_PAIRS=0 or VF_SAFE=1 it changes nothing, and VF_SAFE=1 names it.
+    kp_default, _ = proxy.run(K_PAIRS)
+    kp_comp0, _ = proxy.run(K_PAIRS, {"VF_COMPANIONS": "0"})
+    kp_comp1, _ = proxy.run(K_PAIRS, {"VF_COMPANIONS": "1"})
+    kp_unpaired, _ = proxy.run(K_PAIRS, {"VF_PAIRS": "0"})
+    kp_unpaired_comp1, _ = proxy.run(K_PAIRS, {"VF_PAIRS": "0", "VF_COMPANIONS": "1"})
+    check(f"{K_PAIRS.name}: VF_COMPANIONS=0 equals the default", kp_comp0 == kp_default)
+    check(f"{K_PAIRS.name}: VF_COMPANIONS=1 changes the image (control)", kp_comp1 != kp_default)
+    check(f"{K_PAIRS.name}: VF_COMPANIONS=1 with VF_PAIRS=0 equals VF_PAIRS=0 alone", kp_unpaired_comp1 == kp_unpaired)
+    kp_safe_comp1, said = proxy.run(K_PAIRS, {"VF_SAFE": "1", "VF_COMPANIONS": "1"})
+    check(f"{K_PAIRS.name}: VF_COMPANIONS=1 with VF_SAFE=1 gives the image of VF_PAIRS=0", kp_safe_comp1 == kp_unpaired)
+    check(f"{K_PAIRS.name}: VF_COMPANIONS=1 with VF_SAFE=1 says both are not used",
+          len(said) == 1 and "VF_COMPANIONS=1" in said[0] and MACHINE_PAIRS in said[0], said)
+    kp_notsafe_comp1, _ = proxy.run(K_PAIRS, {"VF_SAFE": "true", "VF_COMPANIONS": "1"})
+    check(f"{K_PAIRS.name}: VF_SAFE='true' keeps VF_COMPANIONS=1", kp_notsafe_comp1 == kp_comp1)
+
 
 def cache(proxy, out):
     def files(directory, suffix):
@@ -288,6 +306,19 @@ def cache(proxy, out):
         manifests.append(files(directory, ".manifest"))
     check("library: default, the switch, the switch in safe mode: three keys; safe mode alone: the third again",
           [len(m) for m in manifests] == [1, 2, 3, 3, 3], manifests)
+
+    # VF_COMPANIONS=1 gets a cache key of its own, separate from the default and from safe mode;
+    # in safe mode, VF_COMPANIONS=1 shares the safe-mode key.
+    for library in (False, True):
+        directory = fresh("cache-companions-" + ("lib" if library else "mod"))
+        settings = {"VF_PROXY_CACHE": str(directory), "VF_LAZY": "1"}
+        seen = []
+        for env in ({}, {"VF_COMPANIONS": "1"}, {"VF_COMPANIONS": "1", "VF_SAFE": "1"}, {"VF_SAFE": "1"}, {}):
+            proxy.run(K_PAIRS, dict(settings, **env), library=library)
+            seen.append(files(directory, ".t"))
+        kind = "library" if library else "module"
+        check(f"{K_PAIRS.name} ({kind}): default, VF_COMPANIONS=1, safe: three keys; safe alone and default reuse theirs",
+              [len(s) for s in seen] == [1, 2, 3, 3, 3], seen)
 
 
 def main():

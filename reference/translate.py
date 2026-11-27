@@ -84,7 +84,7 @@ MATRIX = ('ldsm__sImmOffset', 'ldsm__URsIR', 'hmma_x8_')      # Turing's matrix 
 MATRIX_SCRATCH = 8                 # the registers that the sequence of a matrix instruction computes into
 KEPT = 4                           # the registers of what a function with a product keeps of the lane (`Function.kept`)
 GATHERED = 4                       # the registers that keep the elements of B a product gathered (`Function.matrix_product`)
-AROUND = ('wait', 'save', 'restore', 'lane', 'kept', 'settled', 'to pairs', 'from pairs')   # what the translation puts around an instruction, which is not what the instruction became
+AROUND = ('wait', 'save', 'restore', 'lane', 'kept', 'settled', 'to pairs', 'from pairs', 'companion', 'companion: lane')   # what the translation puts around an instruction, which is not what the instruction became
 # Pairs of products on whole rows (pairing.py; docs/pairs.md): the values kept of the lane
 # for them, in the order of their registers; whether the rows of a matrix load are taken to be
 # aligned on 16 bytes (the policy of the program-text lowering: wide loads then); whether any of it is done.
@@ -575,6 +575,7 @@ class Function:
         self.product_count = sum(1 for d in self.src if d.c.name == 'hmma_x8_')
         self.scratch_need = MATRIX_SCRATCH if self.needs_lane else 0
         self.q = None                               # the plan of pairs on whole rows (`plan_pairs`)
+        self._plans = {}
         self.borrow = None                          # the registers of its own that the translation may take (`Borrowed`)
         self.entered_inside = False                 # set by `translate`: a symbol of another function points into it
         self.uniform = sorted(uniform - {63})
@@ -585,7 +586,10 @@ class Function:
     def plan_pairs(self, wanted=True, companions=True):
         """Decide which products are done as pairs on whole rows (pairing.py), or none of them;
         and whether their loads may take addresses from companions."""
-        self.q = pairing.plan(self, companions) if wanted and PAIRS and self.needs_lane and not self.entered_inside else None
+        key = (bool(wanted), bool(companions))
+        if key not in self._plans:
+            self._plans[key] = pairing.plan(self, companions) if wanted and PAIRS and self.needs_lane and not self.entered_inside else None
+        self.q = self._plans[key]
         sites = self.q.sites if self.q else {}
         # (A product that is not half of a pair is done as before, with what that keeps and gathers.)
         self.has_product = any(d.c.name == 'hmma_x8_' and i not in sites for i, d in enumerate(self.src))
@@ -2198,13 +2202,27 @@ class Function:
         # two products of the program read, which may be other registers than their destinations,
         # or zero; the second goes on in place.)
         onto = to if site['half'] else tuple(255 if c is None else c + k for c in (site['cx'], site['cy']) for k in (0, 2))
-        for n in range(4):
-            word = mc.assemble('hmma__884_f32', size=0, dstfmt=1, srcfmt=1, step=n, satfinite=0, Rd=to[n], Ra=a, tnspA=0,
-                               Rb=b, tnspB=0 if site['transposed'] else 1, Rc=onto[n], **({'dst_wr_sb': SEQUENCE} if n == 3 else {}))
-            # (The program's waits and the wait for the products before: on the first step.)
-            item = Item(with_stall(word, 2) | ((wait | (1 << (WAIT + SEQUENCE))) if n == 0 else 0), i, 'half of a pair')
-            item.covered = n < 3
-            new.append(item)
+        if i in self.q.site_sb:
+            pair_sb = self.q.site_sb[i]
+            seq_wait = (1 << (WAIT + SEQUENCE)) if i in self.q.site_seq_wait else 0
+            reuse_ab = 3 << ((REUSE & -REUSE).bit_length() - 1)
+            for n in range(4):
+                word = mc.assemble('hmma__884_f32', size=0, dstfmt=1, srcfmt=1, step=n, satfinite=0, Rd=to[n], Ra=a, tnspA=0,
+                                   Rb=b, tnspB=0 if site['transposed'] else 1, Rc=onto[n], **({'dst_wr_sb': pair_sb} if n == 3 else {}))
+                # (As native ptxas -arch=sm_70 emits for HMMA.884.F32.F32: stall 2 ending the
+                # group (usched = 18), with Ra.reuse and Rb.reuse on steps 0 to 2.)
+                word |= (18 << USCHED) | (reuse_ab if n < 3 else 0)
+                item = Item(with_stall(word, 2, marks=(n < 3)) | ((wait | (1 << (WAIT + pair_sb)) | seq_wait) if n == 0 else 0), i, 'half of a pair')
+                item.covered = n < 3
+                new.append(item)
+        else:
+            for n in range(4):
+                word = mc.assemble('hmma__884_f32', size=0, dstfmt=1, srcfmt=1, step=n, satfinite=0, Rd=to[n], Ra=a, tnspA=0,
+                                   Rb=b, tnspB=0 if site['transposed'] else 1, Rc=onto[n], **({'dst_wr_sb': SEQUENCE} if n == 3 else {}))
+                # (The program's waits and the wait for the products before: on the first step.)
+                item = Item(with_stall(word, 2) | ((wait | (1 << (WAIT + SEQUENCE))) if n == 0 else 0), i, 'half of a pair')
+                item.covered = n < 3
+                new.append(item)
         # (What follows an instruction is as late after it as in the original: the four steps
         # take eight cycles, and the last one more when the original's stall was longer than that.)
         new[-1].word = with_stall(new[-1].word, max(2, stall_of(w) - 6))
@@ -2940,17 +2958,34 @@ def translate(data, mc=None, listing=None, lives=None):
                 return out
             gave_up = []
             alone = len(fs) == 1 and indices[0] in entries
+            def has_companions():
+                if not pairing.COMPANIONS:
+                    return False
+                for f in fs:
+                    q = f._plans.get((True, True), f.q)
+                    if q and q.roots:
+                        return True
+                return False
+            def paired_at(level):
+                try:
+                    return attempt(True, True, level)
+                except Refused as why:
+                    if not has_companions():
+                        raise
+                    if os.environ.get('VF_PAIRS_SAY'):
+                        print('  without companions, %s: %s' % (fs[0].name[:50], why), file=sys.stderr)
+                    return attempt(True, False, level)
             def usual():
                 try:
                     if BORROW and alone:
                         try:
-                            return attempt(True, True, 2)
+                            return paired_at(2)
                         except Refused as why:
                             gave_up.append(str(why))
                             if os.environ.get('VF_PAIRS_SAY'):
                                 print('  without a borrowed pool, %s: %s' % (fs[0].name[:50], why), file=sys.stderr)
                             try:
-                                return attempt(True, True, 1)
+                                return paired_at(1)
                             except Refused as why:
                                 gave_up.append(str(why))
                                 if os.environ.get('VF_PAIRS_SAY'):
@@ -2963,7 +2998,7 @@ def translate(data, mc=None, listing=None, lives=None):
                     if not any(f.q for f in fs):
                         raise
                     try:
-                        if not any(f.q.roots for f in fs if f.q):
+                        if not has_companions():
                             raise
                         if os.environ.get('VF_PAIRS_SAY'):
                             print('  without companions, %s: %s' % (fs[0].name[:50], why), file=sys.stderr)
@@ -2980,7 +3015,7 @@ def translate(data, mc=None, listing=None, lives=None):
                     if not any(f.q for f in fs):
                         raise
                     try:
-                        if not any(f.q.roots for f in fs if f.q):
+                        if not has_companions():
                             raise
                         return attempt(True, False)
                     except Refused:
@@ -3000,7 +3035,7 @@ def translate(data, mc=None, listing=None, lives=None):
                     done = usual()
             elif BORROW in (7, 9) and alone:
                 # What 6 does, and a function with products may be translated at level 3.
-                # The chain: plain; levels 1, 2; level 3 with room and with products.
+                # The chain: plain; levels 1, 2 (with then without companions); level 3 with room and with products.
                 way = plain
                 try:
                     done = way()
@@ -3009,7 +3044,11 @@ def translate(data, mc=None, listing=None, lives=None):
                         raise
                     gave_up.append(str(why))
                     done = None
-                    for way in (lambda: attempt(True, True, 1), lambda: attempt(True, True, 2), lambda: attempt(False, False, 3)):
+                    steps = [(True, True, 1), (True, False, 1), (True, True, 2), (True, False, 2), (False, False, 3)]
+                    for do_p, do_c, bl in steps:
+                        if do_p and not do_c and not has_companions():
+                            continue
+                        way = lambda do_p=do_p, do_c=do_c, bl=bl: attempt(do_p, do_c, bl)
                         try:
                             done = way()
                             break
@@ -3025,10 +3064,13 @@ def translate(data, mc=None, listing=None, lives=None):
                     limit = graph_register_budget(f.registers, info.data if info is not None else b'')
                     if done[indices[0]][2] > limit and not relocations.get(indices[0]) and not f.tables:
                         top = max(0, limit - 3 - f.save_slots)
-                        for bounded in (lambda: attempt(True, True, 1), lambda: attempt(True, True, 2),
-                                        lambda: attempt(False, False, 3, top)):
+                        steps = [(True, False, 0, None), (True, True, 1, None), (True, False, 1, None),
+                                 (True, True, 2, None), (True, False, 2, None), (False, False, 3, top)]
+                        for do_p, do_c, bl, bnd in steps:
+                            if do_p and not do_c and not has_companions():
+                                continue
                             try:
-                                candidate = bounded()
+                                candidate = attempt(do_p, do_c, bl, bnd)
                             except Refused:
                                 continue
                             if candidate[indices[0]][2] <= limit:
@@ -3054,9 +3096,12 @@ def translate(data, mc=None, listing=None, lives=None):
                         raise
                     gave_up.append(str(why))
                     done = None
-                    for way in (lambda: attempt(True, True, 1), lambda: attempt(True, True, 2), lambda: attempt(False, False, 3)):
+                    steps = [(True, True, 1), (True, False, 1), (True, True, 2), (True, False, 2), (False, False, 3)]
+                    for do_p, do_c, bl in steps:
+                        if do_p and not do_c and not has_companions():
+                            continue
                         try:
-                            done = way()
+                            done = attempt(do_p, do_c, bl)
                             break
                         except Refused as also:
                             gave_up.append(str(also))
@@ -3074,10 +3119,19 @@ def translate(data, mc=None, listing=None, lives=None):
                 # that stays within the budget, or else the one that takes the fewest.
                 f = fs[0]
                 budget = min(max((f.registers + 7) // 8 * 8, 32), 255)
-                ways = [(0, plain), (1, lambda: attempt(True, True, 1)), (2, lambda: attempt(True, True, 2)),
-                        (3, lambda: attempt(False, False, 3, budget - 3 - f.save_slots))]
+                ways = [
+                    (0, True, plain),
+                    (0, False, lambda: attempt(True, False, 0)),
+                    (1, True, lambda: attempt(True, True, 1)),
+                    (1, False, lambda: attempt(True, False, 1)),
+                    (2, True, lambda: attempt(True, True, 2)),
+                    (2, False, lambda: attempt(True, False, 2)),
+                    (3, False, lambda: attempt(False, False, 3, budget - 3 - f.save_slots)),
+                ]
                 best, first_why = None, None
-                for level, way in ways:
+                for level, with_c, way in ways:
+                    if level < 3 and not with_c and not has_companions():
+                        continue
                     try:
                         done = way()
                     except Refused as why:
@@ -3134,12 +3188,22 @@ def translate(data, mc=None, listing=None, lives=None):
             if required and max(r[2] for r in done.values()) > min(required)[0]:
                 limit, threads = min(required)
                 fitted = None
-                if BORROW and alone:
+                if has_companions():
+                    try:
+                        candidate = attempt(True, False, 0)
+                        if max(r[2] for r in candidate.values()) <= limit:
+                            fitted = candidate
+                    except Refused:
+                        pass
+                if fitted is None and BORROW and alone:
                     top = max(0, limit - 3 - fs[0].save_slots)
-                    for bounded in (lambda: attempt(True, True, 1), lambda: attempt(True, True, 2),
-                                    lambda: attempt(False, False, 3, top)):
+                    steps = [(True, True, 1, None), (True, False, 1, None),
+                             (True, True, 2, None), (True, False, 2, None), (False, False, 3, top)]
+                    for do_p, do_c, bl, bnd in steps:
+                        if do_p and not do_c and not has_companions():
+                            continue
                         try:
-                            candidate = bounded()
+                            candidate = attempt(do_p, do_c, bl, bnd)
                         except Refused:
                             continue
                         if max(r[2] for r in candidate.values()) <= limit:

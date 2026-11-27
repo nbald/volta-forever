@@ -55,6 +55,8 @@ pub(super) struct Ctx<'a> {
     pub(super) rows_at: HashMap<u32, u32>,
     /// {name of a kept value: register}.
     pub(super) kept_rows: HashMap<&'static str, u32>,
+    /// {root register: first register of its companions}.
+    pub(super) comp_at: HashMap<u32, u32>,
     /// {destination: how many registers of the translation}.
     pub(super) rows_n: std::collections::BTreeMap<u32, u32>,
     /// Whether rows are aligned on 16 bytes.
@@ -832,6 +834,7 @@ impl Ctx<'_> {
         };
 
         let s = self.scratch()?;
+        let through = q.through.get(&i).copied();
         // The scoreboard for shuffles and loads: not the one the products use.
         let board = if result == ARRIVES { SEQUENCE } else { ARRIVES };
         let mut new: Vec<Item> = Vec::new();
@@ -895,7 +898,7 @@ impl Ctx<'_> {
         let mut spare = s + 4;
         let mut lanes: Vec<u32> = Vec::new();
         for row in &rows {
-            if row.further != 0 {
+            if row.further != 0 && through.is_none() {
                 add(
                     asm(
                         "iadd3_imm__RsIR_RIR",
@@ -944,52 +947,87 @@ impl Ctx<'_> {
             uniform
         };
 
-        // The shuffles: each row's address from the lane that holds it.
-        for (row, &held) in rows.iter().zip(lanes.iter()) {
-            add(
-                asm(
-                    "shfl__RRI",
-                    &[
-                        ("shflmd", Int(0)),
-                        ("Pu", Int(7)),
-                        ("Rd", Int(row.at)),
-                        ("Ra", Int(ra)),
-                        ("Rb", Int(held)),
-                        ("Sc", Int(31)),
-                        ("dst_wr_sb", Int(board)),
-                    ],
-                )
-                .ok_or_else(|| Refused("cannot assemble SHFL for row address".into()))?,
-                "whole row: address",
-                false,
-            );
-        }
-
-        // Add the uniform part / cB to each address.
+        let mut row_addrs: Vec<u32> = rows.iter().map(|r| r.at).collect();
         let mut first = true;
-        if let Some(more_reg) = more {
-            for row in &rows {
+        if let Some((root, made)) = through {
+            let mut held: Vec<u32> = (0..rows.len())
+                .map(|k| self.companion(root, role, k as u32))
+                .collect::<Result<Vec<_>, _>>()?;
+            if let Some(made_i) = made {
+                for (k, row) in rows.iter().enumerate() {
+                    let w_again = self.again(made_i, root, held[k], row.at)?;
+                    add(w_again, "whole row: address", false);
+                    held[k] = row.at;
+                }
+            }
+            if let Some(more_reg) = more {
+                for (k, row) in rows.iter().enumerate() {
+                    add(
+                        asm(
+                            "iadd3_noimm__RRR_RRR",
+                            &[
+                                ("Rd", Int(row.at)),
+                                ("Ra", Int(held[k])),
+                                ("Rb", Int(more_reg)),
+                                ("Rc", Int(255)),
+                            ],
+                        )
+                        .ok_or_else(|| Refused("cannot assemble IADD3 for address".into()))?,
+                        "whole row: address",
+                        false,
+                    );
+                    held[k] = row.at;
+                }
+            }
+            row_addrs = held;
+            first = false;
+        } else {
+            // The shuffles: each row's address from the lane that holds it.
+            for (row, &held) in rows.iter().zip(lanes.iter()) {
                 add(
                     asm(
-                        "iadd3_noimm__RRR_RRR",
+                        "shfl__RRI",
                         &[
+                            ("shflmd", Int(0)),
+                            ("Pu", Int(7)),
                             ("Rd", Int(row.at)),
-                            ("Ra", Int(row.at)),
-                            ("Rb", Int(more_reg)),
-                            ("Rc", Int(255)),
+                            ("Ra", Int(ra)),
+                            ("Rb", Int(held)),
+                            ("Sc", Int(31)),
+                            ("dst_wr_sb", Int(board)),
                         ],
                     )
-                    .ok_or_else(|| Refused("cannot assemble IADD3 for address".into()))?,
+                    .ok_or_else(|| Refused("cannot assemble SHFL for row address".into()))?,
                     "whole row: address",
-                    first,
+                    false,
                 );
-                first = false;
+            }
+
+            // Add the uniform part / cB to each address.
+            if let Some(more_reg) = more {
+                for row in &rows {
+                    add(
+                        asm(
+                            "iadd3_noimm__RRR_RRR",
+                            &[
+                                ("Rd", Int(row.at)),
+                                ("Ra", Int(row.at)),
+                                ("Rb", Int(more_reg)),
+                                ("Rc", Int(255)),
+                            ],
+                        )
+                        .ok_or_else(|| Refused("cannot assemble IADD3 for address".into()))?,
+                        "whole row: address",
+                        first,
+                    );
+                    first = false;
+                }
             }
         }
 
         // The loads.
         let aligned = self.aligned_rows;
-        for row in &rows {
+        for (row, &addr_reg) in rows.iter().zip(row_addrs.iter()) {
             for &(to, byte) in &row.words {
                 for k in 0..if aligned { 1u32 } else { 2 } {
                     let sz = if aligned { "U.64" } else { "U.32" };
@@ -1001,7 +1039,7 @@ impl Ctx<'_> {
                         &[
                             ("sz", Str(sz)),
                             ("Rd", Int(rd_load)),
-                            ("Ra", Int(row.at)),
+                            ("Ra", Int(addr_reg)),
                             ("Ra_offset", Int(off)),
                             ("dst_wr_sb", Int(sb)),
                             ("src_rel_sb", Int(board)),
@@ -1044,6 +1082,141 @@ impl Ctx<'_> {
         Ok(new)
     }
 
+    /// The register that holds `root` as the lane of row `k` of a load of `role` has it.
+    pub(super) fn companion(&self, root: u32, role: crate::pairing::LoadRole, k: u32) -> Result<u32, Refused> {
+        let q = self.q.ok_or_else(|| Refused("companion without a plan".into()))?;
+        let mut at = *self
+            .comp_at
+            .get(&root)
+            .ok_or_else(|| Refused("a companion in a function that was not given registers for it".into()))?;
+        let roles = q
+            .roots
+            .get(&root)
+            .ok_or_else(|| Refused("a companion in a function that was not given registers for it".into()))?;
+        for &r in roles {
+            if r == role {
+                return Ok(at + k);
+            }
+            at += r.rows();
+        }
+        Err(Refused(
+            "a companion in a function that was not given registers for it".into(),
+        ))
+    }
+
+    /// Instruction `made` of the program, done again on `held` in place of `root`, into `to`.
+    fn again(&mut self, made: usize, root: u32, held: u32, to: u32) -> Result<u128, Refused> {
+        let d = &self.src[made];
+        let same = self.dec70.decode_arc(d.word).ok_or_else(|| {
+            Refused(format!(
+                "the instruction at 0x{:x} is not one to do again on a companion",
+                16 * made
+            ))
+        })?;
+        let mut word = super::util::put_operand_by_class(same.name, d.word, "Rd", u64::from(to), true)?;
+        for (op_id, op_name) in [(OP_RA, "Ra"), (OP_RB, "Rb"), (OP_RC, "Rc")] {
+            if d.has_op(op_id) && d.op_or(op_id, 255) == root {
+                word = super::util::put_operand_by_class(same.name, word, op_name, u64::from(held), true)?;
+            }
+        }
+        Ok(with_stall(word & !(63u128 << WAIT) & !REUSE, 1, false))
+    }
+
+    /// The companions that `plan` (before or after instruction `i`) has made there.
+    pub(super) fn accompanied(
+        &mut self,
+        i: usize,
+        plan: &std::collections::BTreeMap<usize, Vec<u32>>,
+    ) -> Result<Vec<Item>, Refused> {
+        use assemble::OpVal::Int;
+        let asm = assemble::assemble;
+        let roots = match plan.get(&i) {
+            Some(rs) if !rs.is_empty() => rs,
+            _ => return Ok(Vec::new()),
+        };
+        let q = self.q.ok_or_else(|| Refused("accompanied without a plan".into()))?;
+        let s = self.scratch()?;
+        let mut out = vec![Item::new(
+            with_stall(NOP, 15, false) | (63u128 << WAIT),
+            i,
+            "settled",
+            true,
+        )];
+        let mut shuffles: Vec<Item> = Vec::new();
+        for &root in roots {
+            let roles = q
+                .roots
+                .get(&root)
+                .ok_or_else(|| Refused("a companion in a function that was not given registers for it".into()))?;
+            for &role in roles {
+                let lanes: Vec<u32> = if role == crate::pairing::LoadRole::BT {
+                    let kbt = *self
+                        .kept_rows
+                        .get("kBT")
+                        .ok_or_else(|| Refused("missing kBT for companion".into()))?;
+                    let mut v = vec![kbt];
+                    for (k, further) in [4u32, 16, 20].into_iter().enumerate() {
+                        let lane_reg = s + 4 + k as u32;
+                        let w = asm(
+                            "iadd3_imm__RsIR_RIR",
+                            &[
+                                ("Rd", Int(lane_reg)),
+                                ("Ra", Int(kbt)),
+                                ("Sb", Int(further)),
+                                ("Rc", Int(255)),
+                            ],
+                        )
+                        .ok_or_else(|| Refused("cannot assemble IADD3 for companion lane".into()))?;
+                        out.push(Item::new(w, i, "companion: lane", true));
+                        v.push(lane_reg);
+                    }
+                    v
+                } else {
+                    let (n0, n1) = if role == crate::pairing::LoadRole::A {
+                        ("kA", "kA2")
+                    } else {
+                        ("kB", "kB2")
+                    };
+                    vec![
+                        *self
+                            .kept_rows
+                            .get(n0)
+                            .ok_or_else(|| Refused("missing kept_rows for companion".into()))?,
+                        *self
+                            .kept_rows
+                            .get(n1)
+                            .ok_or_else(|| Refused("missing kept_rows for companion".into()))?,
+                    ]
+                };
+                for (k, lane) in lanes.into_iter().enumerate() {
+                    let rd = self.companion(root, role, k as u32)?;
+                    let word = asm(
+                        "shfl__RRI",
+                        &[
+                            ("shflmd", Int(0)),
+                            ("Pu", Int(7)),
+                            ("Rd", Int(rd)),
+                            ("Ra", Int(root)),
+                            ("Rb", Int(lane)),
+                            ("Sc", Int(31)),
+                            ("dst_wr_sb", Int(SEQUENCE)),
+                        ],
+                    )
+                    .ok_or_else(|| Refused("cannot assemble SHFL for companion".into()))?;
+                    let wait_bits = if !shuffles.is_empty() && shuffles.len().is_multiple_of(8) {
+                        1u128 << (WAIT + SEQUENCE)
+                    } else {
+                        0
+                    };
+                    shuffles.push(Item::new(word | wait_bits, i, "companion", true));
+                }
+                out.append(&mut shuffles);
+            }
+        }
+        out.last_mut().unwrap().then = Some(SEQUENCE);
+        Ok(out)
+    }
+
     /// A product that is half of a pair.
     pub(super) fn half_of_pair(&self, i: usize, d: &Decoded, wait: u128) -> Result<Vec<Item>, Refused> {
         use assemble::OpVal::Int;
@@ -1072,29 +1245,69 @@ impl Ctx<'_> {
                 site.cy.map_or(255, |c| c + 2),
             ]
         };
-        for n in 0..4u32 {
-            let mut ops = vec![
-                ("size", Int(0)),
-                ("dstfmt", Int(1)),
-                ("srcfmt", Int(1)),
-                ("step", Int(n)),
-                ("satfinite", Int(0)),
-                ("Rd", Int(to[n as usize])),
-                ("Ra", Int(a)),
-                ("tnspA", Int(0)),
-                ("Rb", Int(b)),
-                ("tnspB", Int(if site.transposed { 0 } else { 1 })),
-                ("Rc", Int(onto[n as usize])),
-            ];
-            if n == 3 {
-                ops.push(("dst_wr_sb", Int(SEQUENCE)));
+        if let Some(&pair_sb) = q.site_sb.get(&i) {
+            let seq_wait = if q.site_seq_wait.contains(&i) {
+                1u128 << (WAIT + SEQUENCE)
+            } else {
+                0
+            };
+            let reuse_ab = 3u128 << REUSE.trailing_zeros();
+            for n in 0..4u32 {
+                let mut ops = vec![
+                    ("size", Int(0)),
+                    ("dstfmt", Int(1)),
+                    ("srcfmt", Int(1)),
+                    ("step", Int(n)),
+                    ("satfinite", Int(0)),
+                    ("Rd", Int(to[n as usize])),
+                    ("Ra", Int(a)),
+                    ("tnspA", Int(0)),
+                    ("Rb", Int(b)),
+                    ("tnspB", Int(if site.transposed { 0 } else { 1 })),
+                    ("Rc", Int(onto[n as usize])),
+                ];
+                if n == 3 {
+                    ops.push(("dst_wr_sb", Int(pair_sb)));
+                }
+                let mut word =
+                    asm("hmma__884_f32", &ops).ok_or_else(|| Refused("cannot assemble HMMA for pair".into()))?;
+                // As native `ptxas -arch=sm_70` emits for HMMA.884.F32.F32: stall 2 ending the
+                // group (`usched = 18`), with Ra.reuse and Rb.reuse on steps 0 to 2.
+                word |= (18u128 << USCHED) | if n < 3 { reuse_ab } else { 0 };
+                let waits = if n == 0 {
+                    wait | (1u128 << (WAIT + pair_sb)) | seq_wait
+                } else {
+                    0
+                };
+                let mut item = Item::new(with_stall(word, 2, n < 3) | waits, i, "half of a pair", true);
+                item.covered = n < 3;
+                new.push(item);
             }
-            let word = asm("hmma__884_f32", &ops).ok_or_else(|| Refused("cannot assemble HMMA for pair".into()))?;
-            // The program's waits and the wait for the products before: on the first step only.
-            let waits = if n == 0 { wait | (1u128 << (WAIT + SEQUENCE)) } else { 0 };
-            let mut item = Item::new(with_stall(word, 2, false) | waits, i, "half of a pair", true);
-            item.covered = n < 3;
-            new.push(item);
+        } else {
+            for n in 0..4u32 {
+                let mut ops = vec![
+                    ("size", Int(0)),
+                    ("dstfmt", Int(1)),
+                    ("srcfmt", Int(1)),
+                    ("step", Int(n)),
+                    ("satfinite", Int(0)),
+                    ("Rd", Int(to[n as usize])),
+                    ("Ra", Int(a)),
+                    ("tnspA", Int(0)),
+                    ("Rb", Int(b)),
+                    ("tnspB", Int(if site.transposed { 0 } else { 1 })),
+                    ("Rc", Int(onto[n as usize])),
+                ];
+                if n == 3 {
+                    ops.push(("dst_wr_sb", Int(SEQUENCE)));
+                }
+                let word = asm("hmma__884_f32", &ops).ok_or_else(|| Refused("cannot assemble HMMA for pair".into()))?;
+                // The program's waits and the wait for the products before: on the first step only.
+                let waits = if n == 0 { wait | (1u128 << (WAIT + SEQUENCE)) } else { 0 };
+                let mut item = Item::new(with_stall(word, 2, false) | waits, i, "half of a pair", true);
+                item.covered = n < 3;
+                new.push(item);
+            }
         }
         // What follows an instruction is as late after it as in the original: the four steps
         // take eight cycles, and the last one more when the original's stall was longer than that.
@@ -1308,35 +1521,52 @@ pub(super) fn stand_ins(fd: &FuncData) -> Result<Predicates, Refused> {
     // The lives: instructions where a uniform predicate holds something, joined where the value
     // goes from one to the next. (first instruction, predicate, instructions in order.)
     let mut lives: Vec<(usize, u32, Vec<usize>)> = Vec::new();
+    let mut parent = vec![0usize; n];
+    let mut present = vec![false; n];
+    let mut root_part = vec![usize::MAX; n];
+    fn find_root(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            let up = parent[parent[x]];
+            parent[x] = up;
+            x = up;
+        }
+        x
+    }
     for &q in &fd.uniform_predicates {
         let bit = 7 + q;
         let alive: Vec<usize> = (0..n).filter(|&i| busy[i] >> bit & 1 != 0).collect();
-        let mut parent: HashMap<usize, usize> = alive.iter().map(|&i| (i, i)).collect();
-        fn find(parent: &mut HashMap<usize, usize>, mut x: usize) -> usize {
-            while parent[&x] != x {
-                let up = parent[&parent[&x]];
-                parent.insert(x, up);
-                x = up;
-            }
-            x
+        for &i in &alive {
+            parent[i] = i;
+            present[i] = true;
         }
         for &i in &alive {
+            if live.live_out[i] >> bit & 1 == 0 {
+                continue;
+            }
             for &j in &live.successors[i] {
-                if parent.contains_key(&j) && live.live_out[i] >> bit & 1 != 0 && live.live_in[j] >> bit & 1 != 0 {
-                    let (a, b) = (find(&mut parent, i), find(&mut parent, j));
-                    parent.insert(a, b);
+                if present[j] && live.live_in[j] >> bit & 1 != 0 {
+                    let a = find_root(&mut parent, i);
+                    let b = find_root(&mut parent, j);
+                    parent[a] = b;
                 }
             }
         }
-        let mut parts: Vec<(usize, Vec<usize>)> = Vec::new();
+        let mut parts: Vec<Vec<usize>> = Vec::new();
         for &i in &alive {
-            let root = find(&mut parent, i);
-            match parts.iter_mut().find(|(r, _)| *r == root) {
-                Some((_, part)) => part.push(i),
-                None => parts.push((root, vec![i])),
+            let root = find_root(&mut parent, i);
+            if root_part[root] == usize::MAX {
+                root_part[root] = parts.len();
+                parts.push(vec![i]);
+            } else {
+                parts[root_part[root]].push(i);
             }
         }
-        lives.extend(parts.into_iter().map(|(_, part)| (part[0], q, part)));
+        for &i in &alive {
+            present[i] = false;
+            root_part[parent[i]] = usize::MAX;
+            root_part[i] = usize::MAX;
+        }
+        lives.extend(parts.into_iter().map(|part| (part[0], q, part)));
     }
     lives.sort();
 
@@ -1386,16 +1616,18 @@ pub(super) fn stand_ins(fd: &FuncData) -> Result<Predicates, Refused> {
     let mut later: Vec<(u32, Vec<usize>)> = Vec::new();
     for (q, part) in hard {
         let (i0, i1) = (part[0], part[part.len() - 1]);
-        let touched = (i0..=i1).fold(0u32, |touched, i| {
-            touched | ((live.defs[i] | live.uses[i]) as u32 & 0x7f) | taken_at[i]
-        });
-        let p = pick(touched, &order_up, slow, never);
         let run = part.len() == i1 - i0 + 1 && !(i0 + 1..=i1).any(|i| targets[i]) && (i0..=i1).all(straight);
-        if p.is_none() || !run {
+        if !run {
             later.push((q, part));
             continue;
         }
-        let p = p.unwrap();
+        let touched = (i0..=i1).fold(0u32, |touched, i| {
+            touched | ((live.defs[i] | live.uses[i]) as u32 & 0x7f) | taken_at[i]
+        });
+        let Some(p) = pick(touched, &order_up, slow, never) else {
+            later.push((q, part));
+            continue;
+        };
         let k = slot(i0, i1);
         give(&mut out, &mut taken_at, q, &part, p, true);
         out.saves.entry(i0).or_default().push((k, p));

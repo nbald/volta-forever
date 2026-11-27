@@ -1567,6 +1567,16 @@ mod tests {
             cache_hash(img, &vf_adapt::Policy { pairs: true, ..safe }),
             cache_hash(img, &safe)
         );
+        let with_companions = vf_adapt::Policy {
+            companions: true,
+            ..vf_adapt::Policy::default()
+        };
+        assert_ne!(cache_hash(img, &with_companions), h1);
+        assert_ne!(cache_hash(img, &with_companions), cache_hash(img, &unpaired));
+        assert_ne!(cache_hash(img, &with_companions), cache_hash(img, &safe));
+        let mut comp_safe = with_companions;
+        comp_safe.make_safe();
+        assert_eq!(cache_hash(img, &comp_safe), cache_hash(img, &safe));
     }
 
     #[test]

@@ -224,8 +224,33 @@ product waiting for one scoreboard costs nothing; eight cycles after every last 
 low occupancy; one scoreboard for all loads 23 %; the shuffles of addresses on one scoreboard 15 %;
 all together 38 % at one block a multiprocessor and 2 % at eight.
 
-- Steps two cycles apart; the last step of each product of a pair names the sequence scoreboard,
-  and the first step of each waits for it.
+- By default (`VF_COMPANIONS=0`, or unset): steps two cycles apart (`usched=2`, no `.reuse`);
+  the last step of each product of a pair names the sequence scoreboard (5), and the first step of
+  each waits for it.
+- With opt-in `VF_COMPANIONS=1` (also off under `VF_PAIRS=0` and `VF_SAFE=1`):
+  - **Per-group scoreboards**: paired sites are grouped by register interference (shared
+    accumulator registers `x`, `y`, `cx`, `cy`, or a site's program source registers
+    `{ra+2a, ra+2a+1, rb+2p, rb+2p+1}` overlapping another site's accumulator destination), and each
+    connected component is assigned a hardware scoreboard from `{0..3}` (preferring boards unused
+    by the program and whole-row loads; numbered by smallest site index so Rust and Python agree).
+    Each half's STEP3 names its group's scoreboard and its STEP0 waits for it; a half whose
+    operands come from an un-barriered whole-row load on scoreboard 5 (or from conversions on 5)
+    waits on scoreboard 5 as well.
+  - **`usched=18` and `.reuse` on paired `HMMA.884` steps**: STEP0..2 set `usched=18`
+    (`NO_YIELD | stall 2`) with `Ra.reuse, Rb.reuse` (bits 122..123; `usched` in `17..=27` is
+    required so those bits encode reuse marks rather than a batch), and STEP3 sets `usched=18`
+    without `.reuse` (raised by the original instruction's remaining stall). Native
+    `ptxas -arch=sm_70 -O3` emits the same `usched=18` and `Ra.reuse, Rb.reuse` on 24 of 24
+    `HMMA.884.F32.F32.STEP0..2` instructions (and `usched=18`, no `.reuse` on 7 of 8 `STEP3`s,
+    `usched=17` on 1) in `hmma_micro.sm70.cubin`. Measured on a Tesla V100-SXM2-16GB (1530 MHz,
+    5 alternating rounds on `hmma_micro.sm75.cubin`, 2,000 steps x 20 iters, bit-identical
+    checksums): at 80 / 160 / 640 blocks, default (`VF_COMPANIONS=0`) takes 0.4192 / 0.4419 /
+    1.5450 ms, `VF_COMPANIONS=1` takes **0.3521 / 0.3960 / 1.3317 ms** (1.19x / 1.12x / 1.16x;
+    native sm_70: 0.2532 / 0.3805 / 1.3557 ms), while the two controls on the same translated
+    cubin — clearing `.reuse` (`0.4197 / 0.4407 / 1.6489 ms`) or reverting to `usched=2` without
+    `NO_YIELD`/`.reuse` (`0.4197 / 0.4418 / 1.5522 ms`) — lose the gain entirely (and `usched=18`
+    without `.reuse` regresses by 6.7 % at 640 blocks). Standalone products (`matrix.rs`,
+    `VF_PAIRS=0`, `VF_SAFE=1`) are unchanged.
 - A load of a row names, for what it loads, the scoreboard the original load named: the
   program's readers wait for it as they did. When the original named none, the sequence
   scoreboard: the products of pairs, the only readers of rows, all wait for that one.
@@ -289,12 +314,14 @@ which the conversion runs: the way taken of the conditional branch i, or the oth
 turned). `after`: after instruction i, run only when i falls through. Everything that is not in
 `loads` or `sites` is translated as before.
 
-## 12. Companions: a load's addresses without their shuffles (an experiment, in the reference only)
+## 12. Companions: a load's addresses without their shuffles (opt-in: `VF_COMPANIONS=1`)
 
-`VF_COMPANIONS=1`, read by the Python reference alone (`pairing.companions`, and
-`whole_rows`, `accompanied`, `again` in `reference/translate.py`); off by default, and with it
-off the reference writes what the Rust translator writes. **The validator, the checker of plans
-and the Rust translator know nothing of it: not to be turned on outside experiments.**
+`VF_COMPANIONS=1` (off by default; `0` or unset leaves the output identical to `main`, and
+`VF_PAIRS=0` or `VF_SAFE=1` turns it off) is implemented identically in both the Rust translator
+and the Python reference (`pairing.companions`, `pairing.assign_scoreboards`, and `whole_rows`,
+`accompanied`, `again`, `half_of_pair` in `reference/translate.py` and `crates/vf-sass`), and
+checked by the plan checker (`reference/qcheck.py`), the independent validator
+(`reference/validate.py`), and negative controls (`reference/controls.py`).
 
 Measured: what a warp of the translation waits for, where the same loop written by
 hand does not, is the shuffles of each load's address register: 19 % of the loop kernel's time at
@@ -335,7 +362,8 @@ lanes for a transposed B, the shuffles; what follows waits for them. A load ther
 nothing: its companions arrived long before.
 
 **Registers**: 2 or 4 for each root and role, after everything else; when the function has not
-that many left, companions are dropped first (then pairs, as before).
+that many left at level 0, 1, or 2 (or exceeds its budget / required block size), companions are
+dropped at that level before giving up pairs or falling back to level 3.
 
 **Measured on a V100** (the reference's translation given to a build of the proxy made for the
 experiment; results the same to the last value in every case; 2026-11-18):
@@ -378,9 +406,6 @@ in the loop from two registers the loop writes (`IMAD R, R20, 0x10, R3`): not ha
    tensor cores. A change of the scheduler, to be designed with the validator.
 4. Roots written in the loop by arithmetic on registers that are the same in every lane (the
    loop's counters): needs knowing which registers are.
-5. The validator, the checker of plans (which must be told the roots, the companions' registers,
-   where they are made and which loads go through them, and check that companions stand at every
-   such load on every way), the controls, the Rust translator.
 
 ## 13. In program text (PTX)
 

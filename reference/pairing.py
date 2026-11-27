@@ -18,8 +18,9 @@ LANES = {'BSYNC', 'BREAK', 'KILL', 'PBK', 'PCNT', 'PEXIT', 'PLONGJMP', 'PRET', '
 LEAVES = {'BREAK', 'BRK', 'CONT', 'PEXIT', 'PLONGJMP', 'PRET', 'LONGJMP'}     # of those, the ones after which lanes go on elsewhere
 SAY = bool(os.environ.get('VF_PAIRS_SAY'))
 # Whether the addresses of whole-row loads are taken from kept, shuffled copies of the registers
-# they are made from (docs/pairs.md, section 12): an experiment, off unless asked for.
-COMPANIONS = os.environ.get('VF_COMPANIONS', '0') != '0'
+# they are made from, and paired HMMA steps use per-group scoreboards and native sm_70 scheduling
+# (docs/pairs.md, sections 8 and 12): opt-in (`VF_COMPANIONS=1`), off by default.
+COMPANIONS = os.environ.get('VF_COMPANIONS', '0') == '1'
 ROLES = ('A', 'B', 'BT')
 ROLE_ROWS = {'A': 2, 'B': 2, 'BT': 4}             # how many rows a load of each role takes: a companion for each
 # What may be done again on a companion: arithmetic of one register and constants, lane by lane.
@@ -324,6 +325,7 @@ class Plan:
         # None or the instruction that makes the load's address register from the root)}; where
         # the companions of roots are made: {instruction: [root]}, before it or after it.
         self.roots, self.through, self.made_before, self.made_after = {}, {}, {}, {}
+        self.site_sb, self.site_seq_wait = {}, set()
 
     def conversions(self):
         return ([(i, 'before', r, to, None) for i, c in sorted(self.before.items()) for r, to in c]
@@ -418,9 +420,65 @@ def plan(f, with_companions=True):
     if not result.sites:
         return None
     sharing(result, flow)
+    if COMPANIONS:
+        assign_scoreboards(result, f.src)
+    else:
+        result.site_seq_wait.clear()
     if COMPANIONS and with_companions:
         companions(result, flow, f)
     return result
+
+
+def assign_scoreboards(plan, src):
+    """Assign hardware scoreboards from {0..3} per interfering accumulator group (preferring
+    scoreboards not used by the program or whole-row loads), keeping ARRIVES(4) and SEQUENCE(5)
+    for whole-row address shuffles, un-barriered loads, conversions, and companions."""
+    from machine import READ_BARRIER, WRITE_BARRIER
+    sites = sorted(plan.sites)
+    if not sites:
+        return
+    parent = {i: i for i in sites}
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            if ra > rb:
+                ra, rb = rb, ra
+            parent[rb] = ra
+    acc_regs = {}
+    wr_regs = {}
+    src_regs = {}
+    for i in sites:
+        s = plan.sites[i]
+        wr = {b + k for b in (s['x'], s['y']) for k in range(4)}
+        acc = set(wr)
+        for b in (s['cx'], s['cy']):
+            if b is not None:
+                acc.update(range(b, b + 4))
+        a_base, b_base = s['ra'] + 2 * s['a'], s['rb'] + 2 * s['p']
+        src_r = {a_base, a_base + 1, b_base, b_base + 1}
+        wr_regs[i], acc_regs[i], src_regs[i] = wr, acc, src_r
+    for idx, i in enumerate(sites):
+        for j in sites[idx + 1:]:
+            if (acc_regs[i] & acc_regs[j]) or (src_regs[i] & wr_regs[j]) or (src_regs[j] & wr_regs[i]):
+                union(i, j)
+    lds_used = {(src[j].word >> WRITE_BARRIER) & 7 for j in plan.loads} - {7}
+    prog_used = {b for d in src for b in ((d.word >> WRITE_BARRIER) & 7, (d.word >> READ_BARRIER) & 7)} - {7}
+    avail = (
+        [sb for sb in (3, 2, 1, 0) if sb not in prog_used]
+        + [sb for sb in (3, 2, 1, 0) if sb in prog_used and sb not in lds_used]
+        + [sb for sb in (3, 2, 1, 0) if sb in prog_used and sb in lds_used]
+    )
+    rep_sb = {}
+    for i in sites:
+        rep = find(i)
+        if rep not in rep_sb:
+            rep_sb[rep] = avail[len(rep_sb) % len(avail)]
+        plan.site_sb[i] = rep_sb[rep]
 
 
 def sharing(plan, flow):
@@ -730,6 +788,13 @@ def attempt(f, flow, forms, loads, reach, excluded):
     # (`also`: what the load gives in Turing's layout may be read by something else on some way,
     # as far as can be told: those registers are then made too, as before.)
     out.loads = {j: dict(role=as_, rd=loads[j][0], also=flow.escapes(j, loads[j][0], sites)) for j, as_ in whole.items()}
+    from machine import WRITE_BARRIER
+    for i, s in sites.items():
+        regs = (s['ra'] + 2 * s['a'], s['ra'] + 2 * s['a'] + 1, s['rb'] + 2 * s['p'], s['rb'] + 2 * s['p'] + 1)
+        for k in regs:
+            if any(j in out.loads and ((src[j].word >> WRITE_BARRIER) & 7) == 7 for j in reach[i][k] if j is not None):
+                out.site_seq_wait.add(i)
+                break
     if not sites:
         return out
 

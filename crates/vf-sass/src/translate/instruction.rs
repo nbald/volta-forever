@@ -17,17 +17,32 @@ use super::{ARRIVES, Item, Refused, with_stall};
 
 // ---- translate_one ----
 
+pub(super) fn translate_one_into(ctx: &mut Ctx, i: usize, d: &Decoded, out: &mut Vec<Item>) -> Result<(), Refused> {
+    let w = d.word;
+    // 1. Already an sm_70 instruction with no uniform operands
+    if !d.reads.iter().any(|&(l, _, _)| l == LETTER_U || l == LETTER_Q)
+        && !d.writes.iter().any(|&(l, _)| l == LETTER_U || l == LETTER_Q)
+        && let Some(d70) = ctx.dec70.decode_arc(w)
+    {
+        let mut item = Item::new(w, i, "same", false);
+        item.d = Some(d70);
+        out.push(item);
+        return Ok(());
+    }
+    let items = translate_one_non_same(ctx, i, d)?;
+    out.extend(items);
+    Ok(())
+}
+
 pub(super) fn translate_one(ctx: &mut Ctx, i: usize, d: &Decoded) -> Result<Vec<Item>, Refused> {
+    let mut out = Vec::with_capacity(1);
+    translate_one_into(ctx, i, d, &mut out)?;
+    Ok(out)
+}
+
+fn translate_one_non_same(ctx: &mut Ctx, i: usize, d: &Decoded) -> Result<Vec<Item>, Refused> {
     let w = d.word;
     let name = d.name;
-
-    // 1. Already an sm_70 instruction with no uniform operands
-    if ctx.dec70.decode(w).is_some()
-        && !d.reads.iter().any(|&(l, _, _)| l == LETTER_U || l == LETTER_Q)
-        && !d.writes.iter().any(|&(l, _)| l == LETTER_U || l == LETTER_Q)
-    {
-        return Ok(vec![Item::new(w, i, "same", false)]);
-    }
 
     let guard = if d.has_op(OP_PG) {
         vec![

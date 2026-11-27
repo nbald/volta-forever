@@ -1,7 +1,9 @@
 //! Single-function translation: build items for each instruction, handle borrowed registers
 //! and their loads and stores, then resolve relocations (`follow`).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+
+use crate::fast::{RegSet, regset_clear, regset_intersects, regset_is_empty, regset_set};
 
 use crate::assemble;
 use crate::decode::{Decoder, LETTER_R, LETTER_U};
@@ -11,7 +13,7 @@ use crate::generated::special::*;
 use super::borrowed::Borrowed;
 use super::context::{Ctx, Predicates, entries};
 use super::finish::finish;
-use super::instruction::translate_one;
+use super::instruction::{translate_one, translate_one_into};
 use super::parse::FuncData;
 use super::return_addr::return_addresses;
 use super::schedule::schedule;
@@ -37,6 +39,7 @@ pub(super) fn translate_function(
     q: Option<&crate::pairing::Plan>,
     rows_at: HashMap<u32, u32>,
     kept_rows: HashMap<&'static str, u32>,
+    comp_at: HashMap<u32, u32>,
     aligned_rows: bool,
     has_product_non_pair: bool,
     hold_at: &HashMap<u32, u32>,
@@ -70,6 +73,7 @@ pub(super) fn translate_function(
         q,
         rows_at,
         kept_rows,
+        comp_at,
         rows_n,
         aligned_rows,
         hold_at,
@@ -90,16 +94,80 @@ pub(super) fn translate_function(
 
     let frame = ctx.borrow.as_ref().map_or(0, |b| b.frame_bytes);
     let has_room = ctx.borrow.as_ref().is_some_and(|b| b.room);
-    let mut items: Vec<Item> = Vec::new();
+    let has_slots = ctx.borrow.as_ref().is_some_and(|b| !b.slots.is_empty());
+    let needs_stack_top = frame > 0 || has_room;
+    // At level 3 a matrix sequence takes the lane at its instruction (`Ctx::lane`), and what reads
+    // it is put before the sequence below: such a function takes the full path everywhere.
+    let lane_at_instruction = fd.needs_lane && ctx.lane_at.is_none();
+    let empty_ampere_ops = fd.ampere_ops.is_empty();
+    let empty_held = predicates.held.is_empty();
+    let empty_saves = predicates.saves.is_empty();
+    let empty_restores = predicates.restores.is_empty();
+    let empty_delayed = predicates.delayed.is_empty();
+
+    let mut items: Vec<Item> = Vec::with_capacity(fd.src.len() + 16);
     let mut targets: Vec<u64> = Vec::new();
+    let mut around: Vec<Item> = Vec::with_capacity(8);
+
     for (i, d) in fd.src.iter().enumerate() {
         ctx.at = i;
         ctx.given = regset_empty();
-        ctx.mem_regs.clear();
+        if !ctx.mem_regs.is_empty() {
+            ctx.mem_regs.clear();
+        }
         ctx.base_reg = None;
+
+        // The short path: nothing is put around the instruction's own translation. (Registers
+        // put away for room made, `spilled`, come with `has_room` only.)
+        if i > 0
+            && !has_slots
+            && !needs_stack_top
+            && !lane_at_instruction
+            && !fd.ampere
+            && ctx.q.is_none()
+            && (empty_ampere_ops || !fd.ampere_ops.contains_key(&i))
+            && (empty_held || !predicates.held.contains_key(&i))
+            && (empty_saves || !predicates.saves.contains_key(&i))
+            && (empty_restores || !predicates.restores.contains_key(&i))
+            && (empty_delayed || !predicates.delayed.contains_key(&i))
+        {
+            let start = items.len();
+            translate_one_into(&mut ctx, i, d, &mut items)?;
+            debug_assert!(!ctx.lane_taken.contains_key(&i) && !ctx.spilled.contains_key(&i));
+            if let Some((rel_fid, scale)) = find_relative(d, 75) {
+                let v = field::signed(rel_fid, d.word);
+                let target = 16 * i as i64 + 16 + v * scale as i64;
+                if target % 16 != 0 || target < 0 || target > 16 * fd.src.len() as i64 {
+                    return Err(Refused(format!(
+                        "a branch at 0x{:x} to {}, outside the function",
+                        16 * i,
+                        hex(target)
+                    )));
+                }
+                let target = target as u64;
+                items.last_mut().unwrap().target = Some(target);
+                targets.push(target);
+            }
+            items[start].word |= d.word & (63u128 << WAIT);
+            if let Some(ref borrow) = ctx.borrow {
+                apply_borrowed_mines(
+                    &mut items[start..],
+                    i,
+                    d,
+                    &ctx.given,
+                    borrow,
+                    predicates,
+                    hold_at,
+                    &ctx.pool_taken,
+                );
+            }
+            items[start].first = true;
+            continue;
+        }
+
         if i == 0 {
             ctx.entry_sets_r1 = stack_top(d) && d.writes == [(LETTER_R, 1)] && crate::pairing::unguarded(d);
-        } else if stack_top(d) && ctx.top_again.is_none() {
+        } else if needs_stack_top && ctx.top_again.is_none() && stack_top(d) {
             ctx.top_again = Some(i);
         }
         // Level 3: check the stack pointer.
@@ -169,7 +237,7 @@ pub(super) fn translate_function(
         }
         // Level 3: store to memory after the instruction.
         let after_mem = ctx.stores_after(i, d)?;
-        {
+        if !before_mem.is_empty() || !frame_before.is_empty() || !frame_after.is_empty() || !after_mem.is_empty() {
             let mut combined = before_mem;
             combined.extend(frame_before);
             combined.extend(new_items);
@@ -244,10 +312,10 @@ pub(super) fn translate_function(
             targets.push(target);
         }
         // The uniform predicates held in a register: read back for the instruction, written after it.
-        {
+        if !empty_held && predicates.held.contains_key(&i) {
             let mut held_before: Vec<Item> = Vec::new();
             let mut held_after: Vec<Item> = Vec::new();
-            for &(q, p, reads, writes) in predicates.held.get(&i).into_iter().flatten() {
+            for &(q, p, reads, writes) in &predicates.held[&i] {
                 if ctx.borrow.as_ref().is_some_and(|b| b.predicate_slots.contains_key(&q)) {
                     continue;
                 }
@@ -259,11 +327,13 @@ pub(super) fn translate_function(
                     held_after.push(ctx.written_down(holder, p, i)?);
                 }
             }
-            new_items.splice(0..0, held_before);
+            if !held_before.is_empty() {
+                new_items.splice(0..0, held_before);
+            }
             new_items.extend(held_after);
         }
         // The predicates saved for a life that starts here, and given back after one that ends here.
-        let mut around: Vec<Item> = Vec::new();
+        around.clear();
         for &(k, p) in predicates.saves.get(&i).into_iter().flatten() {
             around.push(ctx.saved(k, p, i)?);
         }
@@ -272,11 +342,20 @@ pub(super) fn translate_function(
             around.push(ctx.given_back(k, p, i)?);
         }
         // The accumulators of pairs brought to the state the instruction, or what follows it, takes them in.
+        // Then the companions of address registers, made where the plan has them.
         if let Some(plan) = ctx.q {
             let before = ctx.converted(i, &plan.before)?;
             let after = ctx.converted(i, &plan.after)?;
-            around.splice(0..0, before);
+            if !before.is_empty() {
+                around.splice(0..0, before);
+            }
             around.extend(after);
+            let comp_before = ctx.accompanied(i, &plan.made_before)?;
+            let comp_after = ctx.accompanied(i, &plan.made_after)?;
+            if !comp_before.is_empty() {
+                around.splice(0..0, comp_before);
+            }
+            around.extend(comp_after);
         }
         // The lane read is the first item of instruction 0: offset 0 stays where it was (a return
         // within the section counts from there), and a branch to offset 0 reads the lane again.
@@ -356,47 +435,20 @@ pub(super) fn translate_function(
         // waits for all six scoreboards (`docs/translator.md`, "Timing rules").
         // What the instruction was given (take): the pool, and at level 3 the rest; and at
         // level 3 the register that holds a uniform predicate, where it is written.
-        let mut at_instr: HashSet<u32> = HashSet::new();
-        for r in 2..255u32 {
-            if regset_test(&ctx.given, r) {
-                at_instr.insert(r);
-            }
-        }
         if let Some(ref borrow) = ctx.borrow {
-            // A held uniform predicate's register, where it is written and that register is
-            // one of the program's (not above).
-            for &(q, _p, _reads, writes) in predicates.held.get(&i).into_iter().flatten() {
-                if writes
-                    && let Some(&hr) = hold_at.get(&q)
-                    && hr <= borrow.top
-                {
-                    at_instr.insert(hr);
-                }
-            }
-        }
-        if let Some(ref borrow) = ctx.borrow {
-            let mut mine: HashSet<u32> = HashSet::new();
-            for &(l, u) in &d.writes {
-                if l == LETTER_U
-                    && let Some(&r) = borrow.homes.get(&u)
-                {
-                    mine.insert(r);
-                }
-            }
-            if let Some(&pool_r) = ctx.pool_taken.get(&i) {
-                mine.insert(pool_r);
-                mine.insert(pool_r + 1);
-            }
-            mine.extend(&at_instr);
-            if !mine.is_empty() {
-                around[0].word |= 63u128 << WAIT;
-                for item in &mut around {
-                    item.borrows.clone_from(&mine);
-                }
-            }
+            apply_borrowed_mines(
+                &mut around,
+                i,
+                d,
+                &ctx.given,
+                borrow,
+                predicates,
+                hold_at,
+                &ctx.pool_taken,
+            );
         }
         around[0].first = true;
-        items.extend(around);
+        items.append(&mut around);
     }
     // After the loop: finish the frame for room made.
     if has_room {
@@ -456,18 +508,25 @@ pub(super) fn translate_function(
     if let Some(ref borrow) = ctx.borrow
         && !borrow.used.is_empty()
     {
-        let used = &borrow.used;
+        let mut used_mask: RegSet = [0; 4];
+        for &r in &borrow.used {
+            regset_set(&mut used_mask, r);
+        }
         for item in &mut items {
-            let d70 = ctx.dec70.decode(item.word);
+            let d70 = if item.d.as_ref().is_some_and(|d| d.word == item.word) {
+                item.d.clone()
+            } else {
+                ctx.dec70.decode_arc(item.word)
+            };
             let Some(ref d70) = d70 else { continue };
             let board = ((item.word >> WRITE_BARRIER) & 7) as u32;
-            let written: HashSet<u32> = d70
-                .writes
-                .iter()
-                .filter(|&&(l, _)| l == LETTER_R)
-                .map(|&(_, r)| r)
-                .collect();
-            if !written.is_disjoint(used) && unannounced(d70) && !item.covered {
+            let mut written: RegSet = [0; 4];
+            for &(l, r) in &d70.writes {
+                if l == LETTER_R {
+                    regset_set(&mut written, r);
+                }
+            }
+            if regset_intersects(&written, &used_mask) && unannounced(d70) && !item.covered {
                 // Borrowed leaves out the registers the program writes so; this is for
                 // what the translation made of an instruction. A covered instruction is
                 // part of a sequence whose later instruction says when the result is there,
@@ -477,10 +536,13 @@ pub(super) fn translate_function(
                     16 * item.origin
                 )));
             }
-            if board != 7 && !written.is_disjoint(&item.borrows) {
+            if board != 7
+                && let Some(ref borrows) = item.borrows
+                && regset_intersects(&written, borrows)
+            {
                 // A result of the translation that is written when it arrives, in a register
                 // the program may write next: the next instruction waits until it is there.
-                item.also.push(board);
+                item.also_mask |= 1u8 << board;
             }
             // An instruction that reads a borrowed register some time after it is issued,
             // for the program: it says on a scoreboard when it has read, so that what the
@@ -488,7 +550,10 @@ pub(super) fn translate_function(
             if !item.late
                 && d70.kind.is_late()
                 && ((item.word >> READ_BARRIER) & 7) == 7
-                && d70.reads.iter().any(|&(l, r, _)| l == LETTER_R && used.contains(&r))
+                && d70
+                    .reads
+                    .iter()
+                    .any(|&(l, r, _)| l == LETTER_R && regset_test(&used_mask, r))
                 && let Ok(w) = read_announced(d70.name, unmarked(d70.name, item.word, item.what), item.origin)
             {
                 item.word = w;
@@ -502,22 +567,28 @@ pub(super) fn translate_function(
             // (`late`.) The instruction after it waits until it has read.
             items[k].then = Some(((items[k].word >> READ_BARRIER) & 7) as u32);
         }
-        if items[k].then.is_some() || !items[k].also.is_empty() {
+        if items[k].then.is_some() || items[k].also_mask != 0 {
             if k + 1 == items.len() {
                 return Err(Refused("a function that ends on a memory instruction".into()));
             }
             if let Some(board) = items[k].then {
                 items[k + 1].word |= 1u128 << (WAIT + board);
             }
-            for &board in &items[k].also.clone() {
+            let mut mask = items[k].also_mask;
+            while mask != 0 {
+                let board = mask.trailing_zeros();
                 items[k + 1].word |= 1u128 << (WAIT + board);
+                mask &= mask - 1;
             }
         }
     }
 
     // Decode all items as sm_70
     for item in &mut items {
-        item.d = Some(match ctx.dec70.decode(item.word) {
+        if item.d.as_ref().is_some_and(|d| d.word == item.word) {
+            continue;
+        }
+        item.d = Some(match ctx.dec70.decode_arc(item.word) {
             Some(d) => d,
             None => {
                 return Err(Refused(format!(
@@ -546,6 +617,51 @@ pub(super) fn translate_function(
         lives,
         paired: q.is_some_and(|plan| !plan.sites.is_empty()),
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_borrowed_mines(
+    group: &mut [Item],
+    i: usize,
+    d: &crate::decode::Decoded,
+    given: &RegSet,
+    borrow: &Borrowed,
+    predicates: &Predicates,
+    hold_at: &HashMap<u32, u32>,
+    pool_taken: &HashMap<usize, u32>,
+) {
+    let mut mine: RegSet = *given;
+    regset_clear(&mut mine, 0);
+    regset_clear(&mut mine, 1);
+    regset_clear(&mut mine, 255);
+    // A held uniform predicate's register, where it is written and that register is
+    // one of the program's (not above).
+    for &(q, _p, _reads, writes) in predicates.held.get(&i).into_iter().flatten() {
+        if writes
+            && let Some(&hr) = hold_at.get(&q)
+            && hr <= borrow.top
+        {
+            regset_set(&mut mine, hr);
+        }
+    }
+    for &(l, u) in &d.writes {
+        if l == LETTER_U
+            && let Some(&r) = borrow.homes.get(&u)
+        {
+            regset_set(&mut mine, r);
+        }
+    }
+    if let Some(&pool_r) = pool_taken.get(&i) {
+        regset_set(&mut mine, pool_r);
+        regset_set(&mut mine, pool_r + 1);
+    }
+    if !regset_is_empty(&mine) {
+        group[0].word |= 63u128 << WAIT;
+        let shared = Box::new(mine);
+        for item in group {
+            item.borrows = Some(shared.clone());
+        }
+    }
 }
 
 /// What the validator is told of a function (`MAP.lives`), in the order in which

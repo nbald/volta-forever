@@ -6,6 +6,7 @@
 
 use crate::field;
 use crate::generated::assembly::*;
+
 /// An operand value: either an integer or a string (enum symbol name).
 #[derive(Clone)]
 pub enum OpVal<'a> {
@@ -14,6 +15,7 @@ pub enum OpVal<'a> {
 }
 
 /// Find an assembly template by class name.
+#[inline]
 fn find_template(name: &str) -> Option<usize> {
     ASM_TEMPLATES.iter().position(|t| t.0 == name)
 }

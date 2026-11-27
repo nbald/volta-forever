@@ -1,8 +1,10 @@
 //! Tests for the translator: scheduling, placement, borrowed registers, predicate
 //! assignment, and assembly of the instructions the translation builds.
+use std::collections::HashSet;
+
 use super::borrowed::Borrowed;
-use super::context::pick;
-use super::parse::{FuncData, placement};
+use super::context::{entries, pick};
+use super::parse::{FuncData, parse_function, placement};
 use super::*;
 use crate::assemble;
 use crate::decode::{Decoder, Kind, LETTER_P, LETTER_R, LETTER_U};
@@ -42,8 +44,21 @@ fn a_batch_does_not_become_marks_of_reuse() {
 #[test]
 fn a_product_has_seventeen_registers() {
     for base in [10u32, 11] {
-        let (_, _, _, lane, kept, gathered, scratch, free, _, _, _) =
-            placement(base, &[], &[], false, 0, true, MATRIX_SCRATCH, true, None, &[], &[]).unwrap();
+        let (_, _, _, lane, kept, gathered, scratch, free, _, _, _, _) = placement(
+            base,
+            &[],
+            &[],
+            false,
+            0,
+            true,
+            MATRIX_SCRATCH,
+            true,
+            None,
+            &[],
+            None,
+            &[],
+        )
+        .unwrap();
         let (lane, kept, gathered, scratch) = (lane.unwrap(), kept.unwrap(), gathered.unwrap(), scratch.unwrap());
         assert_eq!(free - base, 1 + KEPT + GATHERED + MATRIX_SCRATCH);
         assert!(gathered % 2 == 0 && scratch % 2 == 0);
@@ -78,7 +93,7 @@ fn items_of(list: &[Given]) -> Vec<Item> {
             };
             let mut item = Item::new(word, i, what, changed);
             item.first = true;
-            item.d = Some(dec70.decode(word).expect(name));
+            item.d = Some(dec70.decode_arc(word).expect(name));
             if what == "restore" {
                 let mask = item.d.as_ref().unwrap().op_or(OP_SB, 0);
                 item.more_writes
@@ -240,8 +255,21 @@ fn the_schedule_goes_on_through_a_label() {
 #[test]
 fn loads_alone_keep_nothing() {
     for base in [10u32, 11] {
-        let (_, _, _, lane, kept, gathered, scratch, free, _, _, _) =
-            placement(base, &[], &[], false, 0, true, MATRIX_SCRATCH, false, None, &[], &[]).unwrap();
+        let (_, _, _, lane, kept, gathered, scratch, free, _, _, _, _) = placement(
+            base,
+            &[],
+            &[],
+            false,
+            0,
+            true,
+            MATRIX_SCRATCH,
+            false,
+            None,
+            &[],
+            None,
+            &[],
+        )
+        .unwrap();
         assert_eq!(free - base, 1 + MATRIX_SCRATCH);
         assert!(lane.is_some() && kept.is_none() && gathered.is_none() && scratch.unwrap() % 2 == 0);
     }
@@ -635,9 +663,9 @@ fn free_at_skips_given() {
     let b = Borrowed {
         top: 10,
         highest: 10,
-        busy: vec![regset_empty()],
+        busy: std::sync::Arc::new(vec![regset_empty()]),
         taken: vec![regset_empty()],
-        touch: vec![regset_empty()],
+        touch: std::sync::Arc::new(vec![regset_empty()]),
         never: regset_empty(),
         homes: HashMap::new(),
         spans: HashMap::new(),
@@ -646,7 +674,7 @@ fn free_at_skips_given() {
         slots: HashMap::new(),
         predicate_slots: HashMap::new(),
         frame_bytes: 0,
-        depth: vec![None],
+        depth: std::sync::Arc::new(vec![None]),
         r1_fixed: true,
         room: false,
         from_r1: false,
@@ -679,9 +707,9 @@ fn free_at_returns_none_when_full() {
     let b = Borrowed {
         top: 20,
         highest: 20,
-        busy: vec![busy],
+        busy: std::sync::Arc::new(vec![busy]),
         taken: vec![regset_empty()],
-        touch: vec![regset_empty()],
+        touch: std::sync::Arc::new(vec![regset_empty()]),
         never: regset_empty(),
         homes: HashMap::new(),
         spans: HashMap::new(),
@@ -690,7 +718,7 @@ fn free_at_returns_none_when_full() {
         slots: HashMap::new(),
         predicate_slots: HashMap::new(),
         frame_bytes: 0,
-        depth: vec![None],
+        depth: std::sync::Arc::new(vec![None]),
         r1_fixed: true,
         room: false,
         from_r1: false,
@@ -1506,7 +1534,7 @@ fn a_result_of_double_precision_is_read_no_earlier_than_volta_reads_one() {
             .map(|(i, word)| {
                 let mut item = Item::new(word, i, "same", changed);
                 item.first = true;
-                item.d = Some(decoder.decode(word).unwrap());
+                item.d = Some(decoder.decode_arc(word).unwrap());
                 item
             })
             .collect();
@@ -1533,7 +1561,7 @@ fn a_result_of_double_precision_is_read_no_earlier_than_volta_reads_one() {
             .map(|(i, word)| {
                 let mut item = Item::new(word, i, "same", true);
                 item.first = true;
-                item.d = Some(decoder.decode(word).unwrap());
+                item.d = Some(decoder.decode_arc(word).unwrap());
                 item
             })
             .collect();
@@ -1558,7 +1586,7 @@ fn a_result_of_double_precision_is_read_no_earlier_than_volta_reads_one() {
                 let mut item = Item::new(word, i, "same", true);
                 item.anew = anew;
                 item.first = true;
-                item.d = Some(decoder.decode(word).unwrap());
+                item.d = Some(decoder.decode_arc(word).unwrap());
                 item
             })
             .collect();
@@ -1577,4 +1605,565 @@ fn a_result_of_double_precision_is_read_no_earlier_than_volta_reads_one() {
     // A writer earlier in the code that goes on to that place.
     let through = ends(&[with_stall(board(DSETP, 0), 2, false), nop, nop], &[32], true);
     assert_eq!(through[0] + through[1], 15, "{through:?}");
+}
+
+#[test]
+fn parallel_cubin_translation_matches_single_threaded() {
+    let cubins: [(&str, &[u8]); 2] = [
+        (
+            "k_pairs",
+            include_bytes!("../../../../tests/kernels/k_pairs.135.sm75.cubin"),
+        ),
+        (
+            "k_groups",
+            include_bytes!("../../../../tests/kernels/k_groups.135.sm75.cubin"),
+        ),
+    ];
+    let opts = Options::default();
+    for (label, bytes) in cubins {
+        let single = super::cubin::translate_with_threads(bytes, true, &opts, Some(1))
+            .unwrap_or_else(|e| panic!("{label} T=1 failed: {e}"));
+        let multi = super::cubin::translate_with_threads(bytes, true, &opts, Some(4))
+            .unwrap_or_else(|e| panic!("{label} T=4 failed: {e}"));
+        assert_eq!(multi.bytes, single.bytes, "{label}: cubin bytes differ");
+        assert_eq!(multi.map, single.map, "{label}: map differs");
+        assert_eq!(multi.lives, single.lives, "{label}: lives differ");
+        assert_eq!(multi.report, single.report, "{label}: report differs");
+    }
+}
+
+/// At level 3 every register of a matrix sequence is taken at its instruction, the lane too, and
+/// read there (`S2R SR_LANEID`, "lane" in the map): also at an instruction around which nothing
+/// else is put (no uniform register in memory, no room made, the frame empty). `t_stored_plain` of
+/// k_stored.cu with any instruction on uniform registers made a NOP, 128 registers and a NOP that
+/// writes R100 (registers that hold nothing), at VF_BORROW=3 (level 3 first): each of its matrix
+/// loads reads the lane.
+#[test]
+fn at_level_3_each_matrix_instruction_reads_the_lane() {
+    let original = include_bytes!("../../../../tests/kernels/k_stored.135.sm75.cubin");
+    let name = "t_stored_plain";
+    let mut input = crate::elf::Elf::parse(original).unwrap();
+    let section = input.section(&format!(".text.{name}")).unwrap();
+    let info = input.sections[section].info;
+    input.sections[section].info = (128 << 24) | (info & 0x00ff_ffff);
+    let mut dec75 = Decoder::new(75);
+    let mut loads = Vec::new();
+    let mut made_nop = Vec::new();
+    for (i, bytes) in input.sections[section]
+        .data
+        .as_chunks_mut::<16>()
+        .0
+        .iter_mut()
+        .enumerate()
+    {
+        let d = dec75.decode(u128::from_le_bytes(*bytes)).unwrap();
+        let uniform = d
+            .reads
+            .iter()
+            .any(|&(l, _, _)| l == LETTER_U || l == crate::decode::LETTER_Q)
+            || d.writes
+                .iter()
+                .any(|&(l, _)| l == LETTER_U || l == crate::decode::LETTER_Q);
+        if uniform || d.mnemonic == "NOP" {
+            bytes.copy_from_slice(&NOP.to_le_bytes());
+            made_nop.push(i);
+        } else if d.mnemonic == "LDSM" {
+            loads.push(16 * i as u64);
+        }
+    }
+    assert!(!loads.is_empty());
+    // Registers that hold nothing for the sequences to take: one of the NOPs writes R100.
+    let mov = assemble::assemble_int("mov__RCR_RC", &[("Rd", 100)]).unwrap();
+    let k = made_nop[0];
+    input.sections[section].data[16 * k..16 * (k + 1)].copy_from_slice(&mov.to_le_bytes());
+    let opts = Options {
+        borrow: 3,
+        ..Options::default()
+    };
+    let result = translate_with_options(&input.write(), true, &opts).unwrap();
+    let report = result.report.iter().find(|f| f.name == name).unwrap();
+    assert_eq!(report.refused, None);
+    let map = result.map.unwrap();
+    for at in loads {
+        assert!(
+            map.iter()
+                .any(|(f, _, old, what)| f == name && *old == at && what == "lane"),
+            "nothing reads the lane for the matrix load at 0x{at:x}"
+        );
+    }
+}
+
+/// The 16-byte word of a branch, always taken, to `16 * target` from `16 * at` (`at` in its own
+/// function: its relative operand put as `reference/translate.py` reads it).
+fn branch(dec75: &mut Decoder, at: usize, target: usize) -> u128 {
+    // BRA to the next instruction, under no guard.
+    let word: u128 = 0x000fc200038000000000000000007947;
+    let d = dec75.decode(word).unwrap();
+    assert_eq!(d.mnemonic, "BRA");
+    let (fid, scale) = super::util::find_relative(&d, 75).unwrap();
+    let distance = (16 * target as i64 - 16 * at as i64 - 16) / scale as i64;
+    let width = crate::field::width(fid);
+    crate::field::put(fid, word, (distance as u64) & ((1u64 << width) - 1))
+}
+
+/// The functions of k_pairs.cu whose products the translation makes in pairs.
+fn paired_of(data: &[u8]) -> Vec<String> {
+    let result = translate_with_options(data, false, &Options::default()).unwrap();
+    result
+        .report
+        .iter()
+        .filter(|f| f.paired)
+        .map(|f| f.name.clone())
+        .collect()
+}
+
+/// A branch to the end of its function, past its last instruction, leaves the ways through the
+/// function unknown, as `reference/pairing.py` has it (and `main` had it): no pairs, no borrowed
+/// registers. In k_pairs.cu the last instruction of each function with pairs that ends on a NOP
+/// (after its end) made such a branch.
+#[test]
+fn a_branch_to_the_end_of_its_function_leaves_the_ways_unknown() {
+    let original = include_bytes!("../../../../tests/kernels/k_pairs.135.sm75.cubin");
+    let before = paired_of(original);
+    let mut input = crate::elf::Elf::parse(original).unwrap();
+    let mut dec75 = Decoder::new(75);
+    let mut changed = Vec::new();
+    for name in &before {
+        let section = input.section(&format!(".text.{name}")).unwrap();
+        let code = &mut input.sections[section].data;
+        let n = code.len() / 16;
+        let last = u128::from_le_bytes(code[16 * (n - 1)..].try_into().unwrap());
+        if dec75.decode(last).unwrap().mnemonic != "NOP" {
+            continue;
+        }
+        let word = branch(&mut dec75, n - 1, n);
+        code[16 * (n - 1)..].copy_from_slice(&word.to_le_bytes());
+        let fd = parse_function(&mut dec75, name, code, 255, vec![]).unwrap();
+        let flow = crate::pairing::Flow::new(&fd.src, &fd.tables, &entries(&fd));
+        assert!(!flow.known, "{name}");
+        assert!(
+            crate::pairing::plan(&fd.src, &fd.tables, &entries(&fd)).is_none(),
+            "{name}"
+        );
+        assert!(Borrowed::new(&fd, false, None).is_err(), "{name}");
+        changed.push(name.clone());
+    }
+    assert!(!changed.is_empty());
+    let after = paired_of(&input.write());
+    assert!(changed.iter().all(|name| !after.contains(name)), "{after:?}");
+}
+
+/// The window in which a product finds the other of its pair goes on while the next instruction
+/// is not an entry of the function and the one before it is plain (`reference/pairing.py`,
+/// `attempt`): it is not cut where another way comes in that is not among the entries. In
+/// k_pairs.cu, a branch from after the end of the code (reached from nowhere) to the second
+/// product of a pair, with the entries as they were: the pairs stay.
+#[test]
+fn the_pair_window_is_cut_by_entries_only() {
+    let original = include_bytes!("../../../../tests/kernels/k_pairs.135.sm75.cubin");
+    let elf = crate::elf::Elf::parse(original).unwrap();
+    let mut dec75 = Decoder::new(75);
+    let mut tried = 0;
+    for section in elf.sections.iter().filter(|s| s.name.starts_with(".text.")) {
+        let name = &section.name[".text.".len()..];
+        let fd = parse_function(&mut dec75, name, &section.data, 255, vec![]).unwrap();
+        let entered = entries(&fd);
+        let Some(plan) = crate::pairing::plan(&fd.src, &fd.tables, &entered) else {
+            continue;
+        };
+        let n = fd.src.len();
+        let last = n - 1;
+        if fd.src[last].mnemonic != "NOP" {
+            continue;
+        }
+        for (&j, site) in &plan.sites {
+            if site.partner > j {
+                continue;
+            }
+            let mut src = fd.src.clone();
+            let word = branch(&mut dec75, last, j);
+            src[last] = dec75.decode(word).unwrap();
+            let paired = crate::pairing::plan(&src, &fd.tables, &entered);
+            assert_eq!(
+                paired.map(|p| p.sites.keys().copied().collect::<Vec<_>>()),
+                Some(plan.sites.keys().copied().collect::<Vec<_>>()),
+                "{name}: a way into the product at 0x{:x}",
+                16 * j
+            );
+            tried += 1;
+        }
+    }
+    assert!(tried > 0);
+}
+
+/// Where the ways through a function are not known (here no entries are: a branch through a
+/// register without a table gives none), there is no plan, and the flow is asked nothing more
+/// (`debug_assert` of the facts that pairing needs came before that check, and panicked).
+#[test]
+fn no_plan_where_the_ways_are_unknown() {
+    let original = include_bytes!("../../../../tests/kernels/k_pairs.135.sm75.cubin");
+    let elf = crate::elf::Elf::parse(original).unwrap();
+    let mut dec75 = Decoder::new(75);
+    let mut planned = 0;
+    for section in elf.sections.iter().filter(|s| s.name.starts_with(".text.")) {
+        let fd = parse_function(&mut dec75, &section.name[".text.".len()..], &section.data, 255, vec![]).unwrap();
+        if crate::pairing::plan(&fd.src, &fd.tables, &entries(&fd)).is_some() {
+            planned += 1;
+            assert!(
+                crate::pairing::plan(&fd.src, &fd.tables, &None).is_none(),
+                "{}",
+                section.name
+            );
+        }
+    }
+    assert!(planned > 0);
+}
+
+/// What a function calls is read from every section of attributes of its name (`.nv.info.NAME`,
+/// attribute 0x0f), as `main` and `reference/translate.py` read it. In k_pairs.cu, a second
+/// `.nv.info.` section of one function says it calls another, which is refused (its first word is
+/// of no sm_75 class): the one that calls it is refused with it.
+#[test]
+fn every_section_of_attributes_says_what_a_function_calls() {
+    let original = include_bytes!("../../../../tests/kernels/k_pairs.135.sm75.cubin");
+    let mut elf = crate::elf::Elf::parse(original).unwrap();
+    let names: Vec<String> = elf
+        .sections
+        .iter()
+        .filter_map(|s| s.name.strip_prefix(".text.").map(str::to_string))
+        .collect();
+    assert!(names.len() >= 2);
+    let (caller, callee) = (&names[0], &names[1]);
+    let at = elf.section(&format!(".text.{callee}")).unwrap();
+    elf.sections[at].data[..16].copy_from_slice(&[0xff; 16]);
+    let symbols = elf.symbols().unwrap();
+    let symbol = symbols
+        .iter()
+        .position(|s| s.name == *callee && s.info & 0xf == 2)
+        .unwrap() as u32;
+    let info = elf.section(&format!(".nv.info.{caller}")).unwrap();
+    let mut second = elf.sections[info].clone();
+    second.data = [4u8, 0x0f, 4, 0].into_iter().chain(symbol.to_le_bytes()).collect();
+    elf.sections.push(second);
+    let mut data = elf.write();
+    // (`write` keeps the header's count of sections.)
+    data[0x3c..0x3e].copy_from_slice(&(elf.sections.len() as u16).to_le_bytes());
+    let result = translate_with_options(&data, false, &Options::default()).unwrap();
+    let why = |name: &str| result.report.iter().find(|f| f.name == name).unwrap().refused.clone();
+    assert!(why(callee).is_some());
+    assert_eq!(
+        why(caller).as_deref(),
+        Some("a function it calls, or that calls it, is refused")
+    );
+}
+
+/// An unmodified compiler-emitted Triton `sm_75` matmul cubin (`tl.dot` 64x32x16 fp16->fp32,
+/// compiled with `TRITON_DISABLE_LINE_INFO=1`) reaches the level-3 fast path with no uniform
+/// registers in memory and no room made at `VF_BORROW=3`. Before the `empty_lane` fix, every
+/// `S2R SR_LANEID` before its matrix sequences was dropped (`0` of `4` `"lane"` entries).
+#[test]
+fn unmodified_triton_dot_reads_lane_at_level_3() {
+    let original = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/kernels/translate/triton_dot.sm_75.cubin"
+    ));
+    let opts = Options {
+        borrow: 3,
+        ..Options::default()
+    };
+    let result = translate_with_options(original, true, &opts).unwrap();
+    let report = result.report.iter().find(|f| f.name == "k_dot").unwrap();
+    assert_eq!(report.refused, None);
+    let map = result.map.unwrap();
+    let mut lane_pcs = std::collections::HashSet::new();
+    let mut group_pcs = std::collections::HashSet::new();
+    for (fn_name, _dst, src, role) in &map {
+        if fn_name != "k_dot" {
+            continue;
+        }
+        if role == "lane" {
+            lane_pcs.insert(*src);
+        } else if role == "group" {
+            group_pcs.insert(*src);
+        }
+    }
+    assert_eq!(
+        lane_pcs.len(),
+        4,
+        "expected 4 per-instruction S2R SR_LANEID reads at VF_BORROW=3, got {}",
+        lane_pcs.len()
+    );
+    assert!(!group_pcs.is_empty());
+    for pc in group_pcs {
+        assert!(
+            lane_pcs.contains(&pc),
+            "nothing reads the lane for matrix instruction at 0x{pc:x}"
+        );
+    }
+}
+/// Companions and per-group HMMA scheduling are opt-in (`VF_COMPANIONS=1`, default off).
+/// By default, paired HMMA keeps the SEQUENCE scoreboard, stall 2 without NO_YIELD, no `.reuse`,
+/// and no companion registers; with `companions: true`, paired HMMA uses disjoint scoreboards in
+/// 0..4, `usched=18` with `.reuse` on STEP0..2, and hoists loop-invariant load addresses.
+#[test]
+fn companions_are_opt_in_and_default_keeps_sequence_scoreboard() {
+    let original = include_bytes!("../../../../tests/kernels/k_pairs.135.sm75.cubin");
+    let default_opts = Options::default();
+    assert!(!default_opts.companions);
+    let comp_opts = Options {
+        companions: true,
+        ..default_opts
+    };
+
+    let default_res = translate_with_options(original, true, &default_opts).unwrap();
+    let no_comp_res = translate_with_companions(original, true, &default_opts, false).unwrap();
+    let comp_res = translate_with_options(original, true, &comp_opts).unwrap();
+    let with_comp_res = translate_with_companions(original, true, &default_opts, true).unwrap();
+    assert_eq!(default_res.bytes, no_comp_res.bytes);
+    assert_eq!(comp_res.bytes, with_comp_res.bytes);
+    assert_ne!(default_res.bytes, comp_res.bytes);
+
+    let added = |res: &TranslateResult| {
+        let r = res.report.iter().find(|f| f.name == "p_basic").unwrap();
+        r.after - r.before
+    };
+    assert_eq!(added(&default_res), 91);
+    assert_eq!(added(&comp_res), 93);
+
+    // Default: 0 companions, SEQUENCE scoreboard, usched=2 (no NO_YIELD), no .reuse.
+    let count_comp = |res: &TranslateResult| {
+        res.map
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter(|(_, _, _, what)| what == "companion")
+            .count()
+    };
+    assert_eq!(count_comp(&default_res), 0);
+    assert!(count_comp(&comp_res) > 0);
+
+    let check_halves = |res: &TranslateResult, expect_optin: bool| {
+        let elf = crate::elf::Elf::parse(&res.bytes).unwrap();
+        let code = &elf.sections[elf.section(".text.p_basic").unwrap()].data;
+        let map = res.map.as_ref().unwrap();
+        let half_offsets: Vec<usize> = map
+            .iter()
+            .filter(|(name, _, _, what)| name == "p_basic" && what == "half of a pair")
+            .map(|(_, new, _, _)| *new as usize)
+            .collect();
+        assert!(!half_offsets.is_empty());
+        assert_eq!(half_offsets.len() % 4, 0);
+        let word_at = |off: usize| u128::from_le_bytes(code[off..off + 16].try_into().unwrap());
+        let mut boards = HashSet::new();
+        for steps in half_offsets.as_chunks::<4>().0 {
+            let w0 = word_at(steps[0]);
+            let w3 = word_at(steps[3]);
+            let sb = ((w3 >> WRITE_BARRIER) & 7) as u32;
+            let wait0 = ((w0 >> WAIT) & 63) as u32;
+            boards.insert(sb);
+            if expect_optin {
+                for &off in &steps[..3] {
+                    let w = word_at(off);
+                    assert_eq!((w >> USCHED) & 31, 18, "STEP0..2 must set NO_YIELD + stall 2");
+                    assert_ne!(w & REUSE, 0, "STEP0..2 must mark Ra/Rb .reuse");
+                }
+                assert_eq!(w3 & REUSE, 0, "STEP3 must not mark .reuse");
+                assert!(sb < 4, "disjoint accumulator scoreboard expected in 0..4, got {sb}");
+                assert_ne!(wait0 & (1 << sb), 0, "STEP0 must wait on its own pair scoreboard {sb}");
+            } else {
+                for &off in &steps[..3] {
+                    let w = word_at(off);
+                    assert_eq!((w >> USCHED) & 31, 2, "default STEP0..2 must keep stall 2");
+                    assert_eq!(w & REUSE, 0, "default STEP0..2 must not mark .reuse");
+                }
+                assert_eq!(sb, SEQUENCE, "default STEP3 must write SEQUENCE");
+                assert_ne!(wait0 & (1 << SEQUENCE), 0, "default STEP0 must wait on SEQUENCE");
+            }
+        }
+        if expect_optin {
+            assert!(boards.len() > 1, "expected > 1 disjoint scoreboard, got {boards:?}");
+        }
+    };
+    check_halves(&default_res, false);
+    check_halves(&comp_res, true);
+}
+
+/// With `VF_PAIRS=0` (and therefore `VF_SAFE=1`), `VF_COMPANIONS=1` must change nothing,
+/// including `usched` and `.reuse` on standalone `HMMA.884` steps.
+#[test]
+fn companions_with_pairs_off_changes_nothing_including_standalone_hmma() {
+    for cubin in [
+        include_bytes!("../../../../tests/kernels/k_pairs.135.sm75.cubin").as_slice(),
+        include_bytes!("../../../../tests/kernels/k_tensor.135.sm75.cubin").as_slice(),
+    ] {
+        let unpaired = Options {
+            pairs: false,
+            companions: false,
+            ..Options::default()
+        };
+        let unpaired_comp = Options {
+            pairs: false,
+            companions: true,
+            ..Options::default()
+        };
+        let a = translate_with_options(cubin, true, &unpaired).unwrap();
+        let b = translate_with_options(cubin, true, &unpaired_comp).unwrap();
+        assert_eq!(a.bytes, b.bytes);
+        assert_eq!(a.map, b.map);
+        assert_eq!(a.lives, b.lives);
+    }
+    // Verify standalone HMMA.884 steps in k_tensor keep usched == 2 and REUSE == 0 even with companions: true.
+    let tensor = include_bytes!("../../../../tests/kernels/k_tensor.135.sm75.cubin");
+    let opts = Options {
+        companions: true,
+        ..Options::default()
+    };
+    let res = translate_with_options(tensor, true, &opts).unwrap();
+    let elf = crate::elf::Elf::parse(&res.bytes).unwrap();
+    let code = &elf.sections[elf.section(".text.t_mma_f32").unwrap()].data;
+    let mut dec70 = Decoder::new(70);
+    let mut hmma_steps = 0;
+    for chunk in code.as_chunks::<16>().0 {
+        let w = u128::from_le_bytes(*chunk);
+        let d = dec70.decode(w).unwrap();
+        if d.mnemonic == "HMMA" {
+            assert_eq!(w & REUSE, 0, "standalone HMMA must not set REUSE");
+            assert_eq!((w >> USCHED) & 16, 0, "standalone HMMA must not set NO_YIELD");
+            hmma_steps += 1;
+        }
+    }
+    assert_eq!(hmma_steps, 8);
+}
+
+/// When a paired kernel with companions does not fit at level 0 and at level 1 or 2 fits
+/// without companions but not with them, the fallback drops companions at that level instead
+/// of falling straight to level 3 and losing pairs (or being refused at VF_BORROW=6).
+#[test]
+fn level_1_and_2_drop_companions_before_losing_pairs() {
+    let original = include_bytes!("../../../../tests/kernels/k_pairs.135.sm75.cubin");
+    let name = "p_call";
+    let mut dec75 = Decoder::new(75);
+    let mut dec70 = Decoder::new(70);
+    let elf_orig = crate::elf::Elf::parse(original).unwrap();
+    let sec_orig = &elf_orig.sections[elf_orig.section(&format!(".text.{name}")).unwrap()];
+    let fd = parse_function(&mut dec75, name, &sec_orig.data, 255, vec![]).unwrap();
+    let ent = entries(&fd);
+    let plan_comp = crate::pairing::plan_with_companions(&fd.src, &fd.tables, &ent, true, &mut dec70).unwrap();
+    let comp_regs: u32 = plan_comp.companion_registers().values().sum();
+    assert!(comp_regs > 0, "p_call must have companion registers");
+    let nops: Vec<usize> = fd
+        .src
+        .iter()
+        .enumerate()
+        .filter_map(|(i, d)| (d.name == "nop_").then_some(i))
+        .collect();
+    assert!(nops.len() >= 7, "p_call needs 7 NOPs for 6 ULDC.64 + 1 MOV");
+
+    // ULDC.64 UR4, c[0x0][0x170] (from k_uniform.sm75.cubin): each writes an even UR pair that
+    // can be homed at level 1, pushing level 0 (even unpaired) past 253 registers while level 1
+    // and level 2 fit once companions are dropped.
+    let uldc64_base: u128 = 0x000fe40000000a00_00005c0000047ab9;
+    let build_with_high = |high: u32| -> Vec<u8> {
+        let mut input = crate::elf::Elf::parse(original).unwrap();
+        let sidx = input.section(&format!(".text.{name}")).unwrap();
+        for (k, &nop_i) in nops[..6].iter().enumerate() {
+            let ur = (4 + 2 * k) as u128;
+            let w = (uldc64_base & !(0x3fu128 << 16)) | (ur << 16);
+            input.sections[sidx].data[16 * nop_i..16 * (nop_i + 1)].copy_from_slice(&w.to_le_bytes());
+        }
+        let mov = assemble::assemble_int("mov__RCR_RC", &[("Rd", high)]).unwrap();
+        let last_nop = nops[6];
+        input.sections[sidx].data[16 * last_nop..16 * (last_nop + 1)].copy_from_slice(&mov.to_le_bytes());
+        let info = input.sections[sidx].info;
+        input.sections[sidx].info = (255 << 24) | (info & 0x00ff_ffff);
+        input.write()
+    };
+
+    // Find a high register where level 0 fails (even without companions/pairs), level 1 without
+    // companions fits <= 255 declared registers, and adding comp_regs pushes level 1 over 255;
+    // then high + 2 exercises the same fallback at level 2 (borrowing the 2-register pool).
+    let mut found_l1 = None;
+    let mut found_l2 = None;
+    for high in (200u32..=245).rev() {
+        let bytes = build_with_high(high);
+        let l0 = translate_with_options(
+            &bytes,
+            false,
+            &Options {
+                borrow: 0,
+                companions: false,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        if l0.report.iter().find(|f| f.name == name).unwrap().refused.is_none() {
+            continue;
+        }
+        let b6_nocomp = translate_with_options(
+            &bytes,
+            true,
+            &Options {
+                borrow: 6,
+                companions: false,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let rep = b6_nocomp.report.iter().find(|f| f.name == name).unwrap();
+        if rep.refused.is_some() || !rep.paired {
+            continue;
+        }
+        let uses_pool_borrow = b6_nocomp
+            .lives
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|(f, _, _, kind, _)| f == name && *kind == "pool");
+        let out_elf = crate::elf::Elf::parse(&b6_nocomp.bytes).unwrap();
+        let regs = out_elf.sections[out_elf.section(&format!(".text.{name}")).unwrap()].info >> 24;
+        if regs + comp_regs > 255 {
+            if uses_pool_borrow && found_l2.is_none() {
+                found_l2 = Some((high, bytes));
+            } else if !uses_pool_borrow && found_l1.is_none() {
+                found_l1 = Some((high, bytes));
+            }
+        }
+        if found_l1.is_some() && found_l2.is_some() {
+            break;
+        }
+    }
+    let (l1_high, l1_bytes) = found_l1.expect("expected level-1 companion-drop threshold");
+    let (l2_high, l2_bytes) = found_l2.expect("expected level-2 companion-drop threshold");
+
+    for (label, high, bytes) in [("level 1", l1_high, &l1_bytes), ("level 2", l2_high, &l2_bytes)] {
+        for borrow in [6u32, 7] {
+            let res = translate_with_options(
+                bytes,
+                true,
+                &Options {
+                    borrow,
+                    companions: true,
+                    ..Options::default()
+                },
+            )
+            .unwrap();
+            let rep = res.report.iter().find(|f| f.name == name).unwrap();
+            assert_eq!(
+                rep.refused, None,
+                "{label} (R{high}) at VF_BORROW={borrow}: refused instead of dropping companions"
+            );
+            assert!(
+                rep.paired,
+                "{label} (R{high}) at VF_BORROW={borrow}: lost pairs instead of dropping companions"
+            );
+            let comp_items = res
+                .map
+                .as_ref()
+                .unwrap()
+                .iter()
+                .filter(|(f, _, _, what)| f == name && what == "companion")
+                .count();
+            assert_eq!(comp_items, 0, "{label} should have dropped companions");
+        }
+    }
 }

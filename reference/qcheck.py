@@ -37,6 +37,10 @@ def check(mc, src, tables, plan):
     sites = plan.get('sites', {})
     conversions = plan.get('conversions', [])
     share = plan.get('share', {})
+    roots = plan.get('roots', {})
+    made_before = plan.get('made_before', {})
+    made_after = plan.get('made_after', {})
+    through = plan.get('through', {})
 
     # Refuse sites/loads inside a callee's body.
     # Use the callee bodies computed by _compute_called (which stops at RET and callee calls).
@@ -677,5 +681,126 @@ def check(mc, src, tables, plan):
                     err(pi, 'share: product %d needs Rd=%d but mixed' % (pi, dest))
                 elif ll != dest:
                     err(pi, 'share: product %d needs Rd=%d but last load Rd=%d' % (pi, dest, ll))
+
+    # -------------------------------------------------------------------
+    # Section 12: companions
+    # -------------------------------------------------------------------
+    if roots or made_before or made_after or through:
+        reached = [False] * n
+        if n:
+            rw = [0]
+            reached[0] = True
+            while rw:
+                k = rw.pop()
+                for s in cfg.succ[k]:
+                    if not reached[s]:
+                        reached[s] = True
+                        rw.append(s)
+
+        for idx, root_list in made_before.items():
+            if not (0 <= idx < n):
+                err(idx, 'companion before %d: out of range' % idx)
+                continue
+            if idx in callee_body:
+                err(idx, 'cannot check: companion before %d inside callee' % idx)
+            if not reached[idx]:
+                err(idx, 'companion before %d: instruction not reached' % idx)
+            if not cfg.whole[idx]:
+                for root in root_list:
+                    err(idx, 'companion of R%d before %d: not whole' % (root, idx))
+            for root in root_list:
+                if root not in roots:
+                    err(idx, 'companion of R%d before %d: root not in plan' % (root, idx))
+
+        for idx, root_list in made_after.items():
+            if not (0 <= idx < n):
+                err(idx, 'companion after %d: out of range' % idx)
+                continue
+            if idx in callee_body:
+                err(idx, 'cannot check: companion after %d inside callee' % idx)
+            if not reached[idx]:
+                err(idx, 'companion after %d: instruction not reached' % idx)
+            if not cfg._way_whole(idx, cfg.whole):
+                for root in root_list:
+                    err(idx, 'companion of R%d after %d: edge not whole' % (root, idx))
+            for root in root_list:
+                if root not in roots:
+                    err(idx, 'companion of R%d after %d: root not in plan' % (root, idx))
+
+        for root in sorted(roots):
+            if root == 255 or root in tracked:
+                err(None, 'companion root R%d: invalid or accumulator register' % root)
+
+        mirrored = {'LOP3', 'IMAD', 'LEA', 'IADD3', 'SHF', 'MOV'}
+        through_watch = {src[li].ops.get('Ra') for li in through if 0 <= li < n and 'Ra' in src[li].ops}
+        through_watch.discard(None)
+        through_reach = reaching_definitions(cfg, through_watch) if through_watch else [None] * n
+        for li, (root, made_idx) in sorted(through.items()):
+            if li not in loads:
+                err(li, 'companion load %d: not a whole-row load' % li)
+                continue
+            if root not in roots or loads[li]['role'] not in roots[root]:
+                err(li, 'companion load %d: root R%d lacks role %s' % (li, root, loads[li]['role']))
+            ra = src[li].ops.get('Ra')
+            if made_idx is None:
+                if ra != root:
+                    err(li, 'companion load %d: direct root R%d != Ra R%s' % (li, root, ra))
+            else:
+                if not (0 <= made_idx < n):
+                    err(li, 'companion load %d: made %d out of range' % (li, made_idx))
+                    continue
+                defs = through_reach[li].get(ra, frozenset()) if through_reach[li] is not None else frozenset([ENTRY])
+                if defs != frozenset([made_idx]):
+                    err(li, 'companion load %d: Ra R%d reaching defs %s != [%d]' % (li, ra, sorted(defs), made_idx))
+                dm = src[made_idx]
+                reads = {(l, x) for l, x, *_ in dm.reads}
+                if (dm.mnemonic not in mirrored or not is_unguarded(dm) or cfg.kind[made_idx] != 'plain'
+                        or dm.writes != [('R', ra)] or reads != {('R', root)}):
+                    err(li, 'companion load %d: made %d is not a plain mirrored op from R%d to R%d' % (li, made_idx, root, ra))
+                ahead, work = set(), [s for s in cfg.succ[made_idx] if s != made_idx]
+                while work:
+                    k = work.pop()
+                    if k in ahead or k == made_idx:
+                        continue
+                    ahead.add(k)
+                    work.extend(cfg.succ[k])
+                behind, work = set(), [p for p in cfg.pred[li] if p != made_idx]
+                while work:
+                    k = work.pop()
+                    if k in behind or k == made_idx:
+                        continue
+                    behind.add(k)
+                    work.extend(cfg.pred[k])
+                for k in ahead & behind:
+                    if _writes_reg(src[k], root) or (cfg.kind[k] == 'call' and cfg.call_writes(k, root)):
+                        err(li, 'companion load %d: root R%d written at %d between %d and load' % (li, root, k, made_idx))
+                        break
+
+        for root in sorted(roots):
+            before_r = {i for i, rs in made_before.items() if root in rs}
+            after_r = {i for i, rs in made_after.items() if root in rs}
+            write_r = {i for i in range(n)
+                       if _writes_reg(src[i], root) or (cfg.kind[i] == 'call' and cfg.call_writes(i, root))}
+            bare_entry = [i == 0 for i in range(n)]
+            bare_body = [bare_entry[i] and i not in before_r for i in range(n)]
+            changed = True
+            while changed:
+                changed = False
+                for i in range(n):
+                    if not reached[i]:
+                        continue
+                    bb = bare_entry[i] and i not in before_r
+                    if bb != bare_body[i]:
+                        bare_body[i] = bb
+                        changed = True
+                    after_inst = bare_body[i] or (i in write_r)
+                    for s in cfg.succ[i]:
+                        eb = False if (s == i + 1 and i in after_r) else after_inst
+                        if eb and not bare_entry[s]:
+                            bare_entry[s] = True
+                            changed = True
+            for li, (r_li, _) in sorted(through.items()):
+                if r_li == root and 0 <= li < n and bare_body[li]:
+                    err(li, 'companion of R%d does not stand on every way to load %d' % (root, li))
 
     return errors

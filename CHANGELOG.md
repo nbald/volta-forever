@@ -11,10 +11,11 @@
 
 - Under `VF_ALIGNED_ROWS=0`, a forward low-zero-bits dataflow pass over the PTX control-flow graph elides the per-load runtime 16-byte alignment check on `ldmatrix` instructions whose addresses are statically proven 16-byte aligned across all paths from function entry (`docs/emulations.md`).
 
-### Changed
-
 - The proxy cache now stores LZ4-compressed retargeted PTX/fatbin images (`.p`) so subsequent starts skip re-adapting cached modules and libraries materialized on fallback, validates bounded decompressed lengths, keys restored lazy libraries by each load's own policy, and tracks directory size incrementally instead of rescanning on every cache write.
 - Driver hook call counters (`COUNTS`) are incremented only when statistics are asked for (`VF_STATS`).
+- The translation of machine code (sm_75 and sm_80 cubins) takes less time, and runs on worker threads (`vf-sass-N`) for a cubin of 64 KiB of code or more with two functions or more: as many as `VF_THREADS` allows (the CPUs the process may run on, 8 at most, the calling thread among them); where a thread cannot be started, the work left runs on the calling thread (pull request #16, by midhatn). The output is the same bytes at every number of threads, and the same as before the change at every `VF_BORROW` level and with `VF_PAIRS` 0 and 1.
+- `VF_THREADS` caps or disables the threads of the translation of machine code too (`0` or `1`: on the calling thread).
+- Opt-in `VF_COMPANIONS=1` (off by default; `0` or unset leaves translated output unchanged, and `VF_PAIRS=0` or `VF_SAFE=1` turns it off) enables companion register hoisting for loop-invariant whole-row matrix load addresses, per-group disjoint HMMA accumulator scoreboards (`0..3`), and `usched=18` with `.reuse` on `STEP0..2` of paired `HMMA.884` steps in both the Rust and Python translators (`docs/pairs.md`, sections 8 and 12), dropping companions at levels 0, 1, and 2 before giving up pairs.
 
 ### Tests
 
@@ -23,6 +24,7 @@
 - `tests/gpu/run.sh` (`link-file-*`, 232 cases): a file of PTX for sm_75, one of relocatable sm_75 machine code (built by the suite) and a fat binary, given to the driver's linker with `cuLinkAddFile` and `cuLinkAddFile_v2` (`DRVRUN_LINK` of `tests/kernels/drvrun.c`), are linked by the driver and their kernels give the host's results; the three kernels of the cubin that the translator refuses are refused at the lookup, with their line.
 - `tests/gpu/run.sh` (`translated-k_uimad`, 233 cases): the two kernels of `tests/kernels/translate/k_uimad.cu`, with `UIMAD` of an immediate and `UIMAD.WIDE`, give through the layer what their native sm_70 build gives; unit tests translate a word of each new form, and a `UIMAD.X` and a `UIMAD.WIDE.X` put into test kernels, with the two halves of a 64-bit operand on an even register and the next (pull request #15, by midhatn).
 - Validator: the ordinary register that stands for a 64-bit uniform operand is even, and the uniform register above it has the ordinary register above that one wherever it is named alone (pull request #15, by midhatn; the translators already placed pairs so). Two controls come with it: `unpaired` gives the upper half another register, `misruled` alters by one an immediate of an instruction translated to ordinary registers; at the default, one process a cubin, they changed the translation of 46 and 45 of 49 cubins tried (35 of them cubins on which `unpaired` as the pull request wrote it ended its process), and were objected to in each.
+- Validator and plan checker (`reference/validate.py`, `reference/qcheck.py`, `reference/controls.py`, `tests/sass/controls.sh`): added independent decoded-step HMMA interference and arrival-wait rules, `.reuse` mark checks on translation-made instructions, `qcheck.py` whole-place and standing checks for companions, 8 negative controls (`halfsplit`, `halfnoarrive`, `halfreuse`, `halfnoyield`, `compnotsettled`, `compbadlane`, `compdrop`, `compnonwhole`), and a sixth `companions` pass (`VF_COMPANIONS=1`) in `controls.sh`.
 
 ## 0.1.6 (2026-11-25)
 
