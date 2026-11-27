@@ -96,13 +96,31 @@ the function leads to an unknown place, and no call is between them.
 **Pairs of products on whole rows** (`docs/pairs.md`). The validator checks the sequences: a
 register that holds a row is written by loads of rows only, and the loads with one destination
 put the same rows in the same registers; the registers of a half of a pair are the rows of the
-loads of its operands; a half has its other half, and adds to what its products add to; the
-halves say on one scoreboard when their results are there; the conversions of the accumulators
-wait for every scoreboard, fifteen cycles before their first shuffle, and what follows them
-waits for them. Which products may be paired, which loads serve which, and the state of the
-accumulators on every path are the plan: the validator gives it to `reference/qcheck.py`, a
-checker written from the design apart from the planner (`reference/pairing.py`), with its own
-analysis of the flow (`reference/qflow.py`), and reports what it objects to.
+loads of its operands; a half has its other half, and adds to what its products add to; each
+interfering group of halves (derived independently by decoding every half's four translated
+`HMMA.884` steps and checking write/write, read/write and write/read register overlaps, not from
+plan fields) says on one scoreboard when its results are there, and every half waits for the
+scoreboard on which any reaching whole-row load whose program load named no scoreboard announces
+its rows (checked against the half's decoded `Ra` and `Rb` reads); the conversions of the
+accumulators wait for every scoreboard, fifteen cycles before their first shuffle, and what
+follows them waits for them. For companions (`docs/pairs.md`, section 12), the validator checks
+that companion lane offsets (`companion: lane`) and shuffles (`companion`) sit behind the same
+fifteen-cycle all-scoreboard settlement, that each companion register is disjoint from all other
+registers of the translation and never written elsewhere, that companions stand on every path
+from a maker to each load that uses them (with no intervening write of the root), and that
+whole-row loads through companions either read the companion directly or redo a valid plain
+mirrored instruction whose reaching definition is unique. On any instruction the translation
+itself synthesizes (other than `same`, `ordinary registers`, `selection` and `without its cache
+hint`, which may keep marks inherited from the original instruction), every mark of register
+reuse (`.reuse`, decoded from Volta's `TABLES_opex_*` table) must name a real register, must not
+be written by the instruction itself, and must be read in the same operand slot by the
+immediately following instruction; a reuse mark without the no-yield stall bit (`16 << USCHED`)
+names a batch instead and is caught by the batch/opex check. Which products may be paired, which
+loads serve which, the state of the accumulators on every path, and companion roots, make places
+(whole places for `made_before`, whole edges for `made_after`), mirrored definitions and standing
+are the plan: the validator gives it to `reference/qcheck.py`, a checker written from the design
+apart from the planner (`reference/pairing.py`), with its own analysis of the flow
+(`reference/qflow.py`), and reports what it objects to.
 
 ### Predicates
 
@@ -315,16 +333,17 @@ with the next instruction waiting, and the distances between the steps and after
 ## 3. Controls
 
 A check that never objects proves nothing. `reference/controls.py` makes the reference translator
-wrong on purpose, one way at a time, and counts what the validator finds in the result: 117
+wrong on purpose, one way at a time, and counts what the validator finds in the result: 125
 controls, each described at the head of that file. A control that changes translations and meets
 no objection anywhere is a hole in the validator, or a control that tests nothing.
 
 A control needs a translation that has what it takes away. `tests/sass/controls.sh` runs each
-one in a process of its own, in five passes: at the default; with every function made to borrow
+one in a process of its own, in six passes: at the default; with every function made to borrow
 registers (`VF_BORROW=1`); with every kernel at level 3 (`VF_BORROW=8`); with room made
-(`VF_BORROW=5`, the setting of the second translation); and with every frame addressed from
+(`VF_BORROW=5`, the setting of the second translation); with every frame addressed from
 its top, which a register is loaded with (`VF_BORROW=3`), for the two controls on that
-register. In each pass the translation as it is is validated first. On 39 cubins (the 16 test
+register; and with companion address hoisting on (`VF_COMPANIONS=1`), for the four companion
+controls. In each pass the translation as it is is validated first. On 39 cubins (the 16 test
 cubins of `tests/kernels`, 17 of PyTorch's and 6 of the held-out corpus, chosen for having what
 the controls need), 2026-11-23:
 
@@ -346,6 +365,27 @@ default, one process a cubin, on 49 cubins (35 of the held-out corpus and of the
 which `unpaired` stopped until it took the arguments of the translator by their names, and 14
 others), `unpaired` changed the translation of 46 and was objected to in each, `misruled` changed
 45 and was objected to in each.
+
+Eight more controls came on 2026-11-26 with the validator and plan-checker rules for per-group
+HMMA scoreboards, un-barriered whole-row arrival waits, `.reuse` marks on translation-made
+instructions, and companions (section 2, "Pairs of products on whole rows"): `halfsplit` puts the
+first half of a pair on another scoreboard than its partner while still waiting on its own;
+`halfnoarrive` moves halves off the scoreboard used by an un-barriered whole-row load;
+`halfreuse` marks `Rc` for register reuse on `STEP0` with the no-yield stall bit set (`usched=18`,
+`batch=0`, seen to pass with 0 objections before the reuse rule); `halfnoyield` sets A/B reuse
+marks on `STEP0..2` without the no-yield stall bit (turning them into `batch_t=3`);
+`compnotsettled` shortens the settlement stall before companion shuffles to 2 cycles;
+`compbadlane` corrupts a companion lane offset or shuffle clamp; `compdrop` drops the first
+companion maker; and `compnonwhole` adds a companion make at a reachable non-whole place (seen to
+pass with 0 objections before `qcheck.py`'s whole-place rule). In `tests/sass/controls.sh` across
+all six passes on the 17 checked-in test cubins (`85` of `125` controls objected to, `0` silent,
+`0` missed, `0` problems as it is), `halfsplit`, `halfnoarrive`, `halfreuse` and `halfnoyield`
+each changed and were objected to in `2 of 2` cubins (`k_pairs`, `k_groups`) at the default, and
+`compnotsettled`, `compbadlane`, `compdrop` and `compnonwhole` each changed and were objected to
+in `1 of 1` cubin (`k_pairs`) in the `companions` pass (`VF_COMPANIONS=1`). On 34 cubins (the 17
+test cubins, 15 of PyTorch and 2 held-out), the four pair controls were each objected to in
+`3 of 3` (`k_pairs`, `k_groups`, `0448`) and the four companion controls in `2 of 2` (`k_pairs`,
+`0448`), with `0` problems as it is across all six passes.
 
 A control may change a translation that stays right, and is then rightly not objected to there:
 `alive_home` moves every home to the next register, which may be free too; `short_home` leaves

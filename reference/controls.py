@@ -112,6 +112,27 @@ these change nothing then):
                 must object: nothing else looks at the states of the accumulators)
     notalso     a load whose result in Turing's layout something else reads does not give it
                 (the same: only the checker of plans knows who reads what)
+    halfsplit   the first half of a pair names another scoreboard than its partner, which shares
+                its accumulators (each half still waits for its own scoreboard)
+    halfnoarrive
+                in a function with a whole-row load whose program's load named no scoreboard, the
+                halves of pairs name another scoreboard and do not wait for the load's own
+    halfreuse   the first step of a half of a pair marks its accumulator source (Rc) for register
+                reuse with the no-yield stall bit set: the next step reads Rc+2 (or RZ) and the
+                first step may write Rc itself
+    halfnoyield the first three steps of a half of a pair carry register-reuse marks on A and B
+                without the no-yield stall bit (bit 4 of usched): on Volta those bits then name a
+                batch (REQ_BAR) instead of register reuse
+
+With companions (VF_COMPANIONS=1: address shuffles hoisted out of loops, docs/pairs.md section 12):
+
+    compnotsettled
+                the instruction before companion shuffles stalls 2 cycles, not 15
+    compbadlane a companion's lane offset or shuffle clamp is corrupted
+    compdrop    the first place that makes companions leaves them out
+    compnonwhole
+                a companion is also made at a reachable non-whole place (every companion still
+                stands, so only qcheck.py's whole-place rule objects)
 
 With a predicate that the program writes late (a comparison of doubles, an instruction of a late
 kind: docs/translator.md, "Predicates written late"; the translator takes such a predicate only
@@ -342,7 +363,7 @@ tests/sass/controls.sh fail on each but those of RIGHT_THERE, each looked at.
 import collections, inspect, os, re, struct, subprocess, sys, tempfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import elf, machine, translate
-from machine import READ_BARRIER, WRITE_BARRIER, WAIT, stall_of, with_stall
+from machine import READ_BARRIER, REUSE, USCHED, WRITE_BARRIER, WAIT, stall_of, with_stall
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 Function = translate.Function
@@ -451,7 +472,8 @@ def patched(control):
     stand_ins, liveness, late, schedule, return_addresses = (
         Function.stand_ins, Function.liveness, Function.late, Function.schedule, Function.return_addresses)
     matrix_load, matrix_product, kept = Function.matrix_load, Function.matrix_product, Function.kept
-    kept_for_rows, whole_rows, half_of_pair, converted = Function.kept_for_rows, Function.whole_rows, Function.half_of_pair, Function.converted
+    kept_for_rows, whole_rows, half_of_pair, converted, accompanied = (
+        Function.kept_for_rows, Function.whole_rows, Function.half_of_pair, Function.converted, Function.accompanied)
     given_back = Function.given_back
 
     def alive_scratch_pred(self):
@@ -766,6 +788,102 @@ def patched(control):
         finally:
             load['also'] = was
 
+    def halfsplit(self, i, *args):
+        new = half_of_pair(self, i, *args)
+        if i in self.q.sites and self.q.sites[i]['half'] == 0 and len(self.q.sites) >= 2:
+            sb = (new[3].word >> WRITE_BARRIER) & 7
+            alt = (sb + 1) & 3
+            new[3].word = (new[3].word & ~(7 << WRITE_BARRIER)) | (alt << WRITE_BARRIER)
+            new[0].word |= 1 << (WAIT + alt)
+        return new
+
+    def halfnoarrive(self, i, d, wait):
+        new = half_of_pair(self, i, d, wait)
+        arrive_rds = {self.q.loads[j]['rd'] for j in self.q.loads
+                      if ((self.src[j].word >> WRITE_BARRIER) & 7) == 7}
+        if arrive_rds and any(
+                (s['ra'] in arrive_rds or s['rb'] in arrive_rds)
+                and not (((self.src[k].word >> WAIT) & 63) >> translate.SEQUENCE & 1)
+                for k, s in self.q.sites.items()):
+            sb = (new[3].word >> WRITE_BARRIER) & 7
+            if sb == translate.SEQUENCE:
+                alt = 3
+                new[3].word = (new[3].word & ~(7 << WRITE_BARRIER)) | (alt << WRITE_BARRIER)
+                new[0].word |= 1 << (WAIT + alt)
+            if not (wait & (1 << (WAIT + translate.SEQUENCE))):
+                new[0].word &= ~(1 << (WAIT + translate.SEQUENCE))
+        return new
+
+    def halfreuse(self, *args):
+        new = half_of_pair(self, *args)
+        # Mark Rc for reuse on STEP0 with no-yield usched=18 (batch==0): STEP1 reads Rc+2 (or RZ),
+        # and STEP0 may write Rc itself when accumulating in place.
+        reuse_shift = (REUSE & -REUSE).bit_length() - 1
+        new[0].word = (new[0].word & ~(31 << USCHED) & ~REUSE) | (18 << USCHED) | (4 << reuse_shift)
+        return new
+
+    def halfnoyield(self, *args):
+        new = half_of_pair(self, *args)
+        # Mark Ra and Rb for reuse on STEP0..2 without the no-yield bit (16 << USCHED):
+        # on Volta the same bits then name a batch (REQ_BAR) instead of register reuse.
+        reuse_shift = (REUSE & -REUSE).bit_length() - 1
+        for item in new[:3]:
+            item.word = (item.word & ~(16 << USCHED)) | (3 << reuse_shift)
+        return new
+
+    def compnotsettled(self, i, plan):
+        new = accompanied(self, i, plan)
+        if new:
+            new[0].word = with_stall(new[0].word, 2)
+        return new
+
+    def compbadlane(self, i, plan):
+        new = accompanied(self, i, plan)
+        c = self.mc.md70.by_name['iadd3_imm__RsIR_RIR']
+        for item in new:
+            if item.what == 'companion: lane':
+                item.word = self.put(c, item.word, 'Sb', self.mc.d70.operands(c, item.word)['Sb'] ^ 2)
+                return new
+        shfl = self.mc.md70.by_name['shfl__RRI']
+        for item in new:
+            if item.what == 'companion':
+                item.word = self.put(shfl, item.word, 'Sc', 15)
+                return new
+        return new
+
+    def compdrop(self, i, plan):
+        if plan and i == next(iter(plan)):
+            return []
+        return accompanied(self, i, plan)
+
+    def compnonwhole(self, i, plan):
+        if plan is self.q.made_before and self.q.roots:
+            if not hasattr(self, '_compnonwhole_at'):
+                import qflow
+                cfg = qflow.CFG(self.src, self.tables).build(self.mc)
+                reachable, work = set(), [0]
+                while work:
+                    u = work.pop()
+                    if u in reachable:
+                        continue
+                    reachable.add(u)
+                    work.extend(cfg.succ[u])
+                root = next(iter(self.q.roots))
+                candidates = [p for p in range(1, len(self.src))
+                              if p in reachable and not cfg.whole[p]
+                              and p not in self.q.made_before and p not in self.q.made_after
+                              and p not in self.q.before and p not in self.q.after
+                              and p not in self.q.loads and p not in self.q.sites
+                              and cfg.kind[p] == 'plain']
+                pick = next((p for p in candidates if p not in self.delayed), candidates[0] if candidates else None)
+                if pick is None and not cfg.whole[0] and 0 not in self.q.made_before and 0 not in self.q.before:
+                    pick = 0
+                self._compnonwhole_at = (pick, [root]) if pick is not None else (None, None)
+            pick, roots = self._compnonwhole_at
+            if i == pick:
+                return accompanied(self, i, {i: roots})
+        return accompanied(self, i, plan)
+
     def unpermuted(self, i, plan):
         if not {'pi', 'inv'} <= set(self.kept_rows):
             return converted(self, i, plan)
@@ -902,6 +1020,14 @@ def patched(control):
         'unpermuted': {'converted': unpermuted},
         'unconverted': {'converted': unconverted},
         'notalso': {'whole_rows': notalso},
+        'halfsplit': {'half_of_pair': halfsplit},
+        'halfnoarrive': {'half_of_pair': halfnoarrive},
+        'halfreuse': {'half_of_pair': halfreuse},
+        'halfnoyield': {'half_of_pair': halfnoyield},
+        'compnotsettled': {'accompanied': compnotsettled},
+        'compbadlane': {'accompanied': compbadlane},
+        'compdrop': {'accompanied': compdrop},
+        'compnonwhole': {'accompanied': compnonwhole},
         'slowno': {},
         'slowshort': {},
         'slownowait': {},
@@ -1341,8 +1467,12 @@ def patched(control):
 
 CONTROLS = ['as it is', 'unsaved', 'blind', 'cut', 'masks', 'nowait', 'close', 'doublesoon', 'doubleacross', 'returns', 'waitless', 'unlisted', 'swapped', 'batched', 'unmoved', 'named', 'unguarded', 'lanes', 'unwaited', 'unordered', 'complement_rewritten', 'complement_same', 'soon', 'partial', 'boardless', 'unmasked', 'early', 'unheld', 'unwritten', 'stale', 'unkept', 'unpaired', 'misruled', 'slowno', 'slowshort', 'slownowait', 'slownever', 'slowfree', 'slowsaved', 'alive_scratch']
 # (Those of pairs of products on whole rows: only when the translator makes them, not with VF_PAIRS=0.)
-PAIR_CONTROLS = ['rowlane', 'otherrow', 'rowwait', 'rowread', 'halfswap', 'halfk', 'inplace', 'stepfast', 'unsettled', 'unsynced', 'unpermuted', 'unconverted', 'notalso']
+PAIR_CONTROLS = ['rowlane', 'otherrow', 'rowwait', 'rowread', 'halfswap', 'halfk', 'inplace', 'stepfast', 'unsettled', 'unsynced', 'unpermuted', 'unconverted', 'notalso',
+                 'halfsplit', 'halfnoarrive', 'halfreuse', 'halfnoyield']
 CONTROLS += PAIR_CONTROLS
+# (Those of companions: only when VF_PAIRS!=0 and VF_COMPANIONS=1.)
+COMPANION_CONTROLS = ['compnotsettled', 'compbadlane', 'compdrop', 'compnonwhole']
+CONTROLS += COMPANION_CONTROLS
 # (Those of borrowed registers: only when VF_BORROW=1.)
 BORROW_CONTROLS = ['alive_pair', 'alive_home', 'no_borrow_wait', 'no_late_borrow', 'written_pair', 'shared_home', 'overlap_pool', 'short_home', 'pool_in_home_unsaid']
 CONTROLS += BORROW_CONTROLS
@@ -1398,8 +1528,10 @@ RIGHT_THERE = {
 
 
 def setting():
-    """The setting of the translator as RIGHT_THERE names it: `default`, or the value of VF_BORROW."""
-    return os.environ.get('VF_BORROW') or 'default'
+    """The setting of the translator as RIGHT_THERE names it: `default`, `companions`, or the value of VF_BORROW."""
+    if os.environ.get('VF_BORROW'):
+        return os.environ['VF_BORROW']
+    return 'companions' if translate.pairing.COMPANIONS else 'default'
 
 
 def unobjected(control, setting, cubins, counts):
@@ -1465,7 +1597,7 @@ def run(mc, control, path, out_dir, untouched, validated=True):
     changed nothing in its translation, which `untouched` holds by path. (`validated` false: the
     translation as it is is kept there and not validated.)"""
     originals = {name: getattr(Function, name) for name in ('stand_ins', 'liveness', 'late', 'schedule', 'return_addresses', 'matrix_load', 'matrix_product', 'kept', 'kept_gathering', 'given_back', 'all_predicates', 'waits_for', 'masked', 'translate', 'one',
-                                                             'kept_for_rows', 'whole_rows', 'half_of_pair', 'converted',
+                                                             'kept_for_rows', 'whole_rows', 'half_of_pair', 'converted', 'accompanied',
                                                              'from_memory', 'to_memory', 'frame_top', 'load_word', 'store_word', 'read_back')}
     for name, replacement in patched(control).items():
         setattr(Function, name, replacement)
@@ -2717,6 +2849,8 @@ def main():
                 continue
             if control in PAIR_CONTROLS and not translate.PAIRS:
                 continue
+            if control in COMPANION_CONTROLS and not (translate.PAIRS and translate.pairing.COMPANIONS):
+                continue
             if control in BORROW_CONTROLS and not translate.BORROW:
                 continue
             if control in FRAME_CONTROLS and translate.BORROW < 2:
@@ -2748,6 +2882,8 @@ def main():
                     print('           (and rightly not in %s: RIGHT_THERE)' % ', '.join(right))
     if not translate.PAIRS:
         print('(the controls of pairs on whole rows were not run: the translator makes none with VF_PAIRS=0)')
+    elif not translate.pairing.COMPANIONS:
+        print('(the controls of companions were not run: the translator makes none without VF_COMPANIONS=1)')
     if not translate.BORROW:
         print('(the controls of borrowed registers were not run: the translator does not borrow with VF_BORROW=0)')
     print('every control is objected to, and the translation as it is to nothing' if ok else 'NOT EVERY CONTROL IS OBJECTED TO (a hole in the check, a fault in the translation, or cubins that lack what a control takes away): see above')

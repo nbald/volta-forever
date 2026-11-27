@@ -293,8 +293,10 @@ turned). `after`: after instruction i, run only when i falls through. Everything
 
 `VF_COMPANIONS=1`, read by the Python reference alone (`pairing.companions`, and
 `whole_rows`, `accompanied`, `again` in `reference/translate.py`); off by default, and with it
-off the reference writes what the Rust translator writes. **The validator, the checker of plans
-and the Rust translator know nothing of it: not to be turned on outside experiments.**
+off the reference writes what the Rust translator writes. The independent validator
+(`reference/validate.py`), the checker of plans (`reference/qcheck.py`) and the controls
+(`reference/controls.py`, pass `companions`) now check companions; **the Rust translator still
+knows nothing of it: not to be turned on outside experiments.**
 
 Measured: what a warp of the translation waits for, where the same loop written by
 hand does not, is the shuffles of each load's address register: 19 % of the loop kernel's time at
@@ -378,9 +380,8 @@ in the loop from two registers the loop writes (`IMAD R, R20, 0x10, R3`): not ha
    tensor cores. A change of the scheduler, to be designed with the validator.
 4. Roots written in the loop by arithmetic on registers that are the same in every lane (the
    loop's counters): needs knowing which registers are.
-5. The validator, the checker of plans (which must be told the roots, the companions' registers,
-   where they are made and which loads go through them, and check that companions stand at every
-   such load on every way), the controls, the Rust translator.
+5. The Rust translator (the validator, the checker of plans and the controls now check companions,
+   their whole-place creation and their standing on every way).
 
 ## 13. In program text (PTX)
 
