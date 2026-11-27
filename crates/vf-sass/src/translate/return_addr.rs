@@ -1,7 +1,7 @@
 //! Return addresses: find the MOV instructions in the translated code that hold return
 //! addresses or jump-table entries, and rewrite them once the new offsets are known.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::decode::{Kind, LETTER_R};
 use crate::generated::fields::*;
@@ -13,18 +13,66 @@ use super::{Item, Refused, hex};
 
 /// Also finds the jump tables to move with the code: (where in the constants of the function, the
 /// places as they are).
-pub(super) fn return_addresses(
-    items: &mut [Item],
-    targets: &[u64],
-    fd: &FuncData,
-) -> Result<Vec<(u32, Vec<u64>)>, Refused> {
+type ReturnAddresses = (Vec<(u32, Vec<u64>)>, Vec<(u64, u64)>);
+
+pub(super) fn return_addresses(items: &mut [Item], targets: &[u64], fd: &FuncData) -> Result<ReturnAddresses, Refused> {
     let src = &fd.src;
     let mut relocate: Vec<(u32, Vec<u64>)> = Vec::new();
+    let mut lepc_pairs: Vec<(u64, u64)> = Vec::new();
     // Build MOV immediate index: immediate value -> list of item indices
     let mut movs: HashMap<u32, Vec<usize>> = HashMap::new();
     for (k, item) in items.iter().enumerate() {
         if let Some(v) = immediate_of(item) {
             movs.entry(v).or_default().push(k);
+        }
+    }
+
+    // A LEPC immediately before a direct call is that call's return address: both instructions
+    // move with the code, so the address the LEPC reads stays the instruction after the call.
+    let mut link_lepc: HashSet<usize> = HashSet::new();
+    for k in 1..items.len() {
+        let d = items[k].d.as_ref().unwrap();
+        if !d.name.starts_with("call_rel") || targets.contains(&(16 * items[k].origin as u64)) {
+            continue;
+        }
+        let p = items[k - 1].d.as_ref().unwrap();
+        if p.mnemonic == "LEPC" {
+            link_lepc.insert(k - 1);
+        }
+    }
+
+    // The callee of a direct call is the judge of whether an adjacent LEPC is its return
+    // address: the ways of the source say what it returns through. The flow is built only when
+    // there is such a pair to judge.
+    let flow = if link_lepc.is_empty() {
+        None
+    } else {
+        Some(crate::pairing::Flow::new(src, &fd.tables, &super::context::entries(fd)))
+    };
+    let mut accepted_lepc: HashSet<usize> = HashSet::new();
+    let mut accepted_call: HashSet<usize> = HashSet::new();
+    if let Some(flow) = &flow {
+        for k in 1..items.len() {
+            if !link_lepc.contains(&(k - 1)) {
+                continue;
+            }
+            let d = items[k].d.as_ref().unwrap();
+            if !d.name.starts_with("call_rel") {
+                continue;
+            }
+            let pair = flow.known
+                && items[k].target.is_some_and(|target| {
+                    callee_returns_through_lepc(
+                        src,
+                        flow,
+                        (target / 16) as usize,
+                        items[k - 1].d.as_ref().unwrap().op_or(OP_RD, 255),
+                    )
+                });
+            if pair {
+                accepted_lepc.insert(k - 1);
+                accepted_call.insert(k);
+            }
         }
     }
 
@@ -75,28 +123,39 @@ pub(super) fn return_addresses(
                 )));
             }
             let back = (16 * origin + 16) as u32;
-            let found: Vec<usize> = movs.get(&back).cloned().unwrap_or_default();
-            if found.len() != 1 || found[0] > k {
-                return Err(Refused(format!(
-                    "the return address of the call at 0x{:x} is not given by exactly one MOV",
-                    16 * origin
-                )));
-            }
-            let j = found[0];
-            let register = items[j].d.as_ref().unwrap().op_or(OP_RD, 255);
-            for between in &items[j + 1..k] {
-                let bd = between.d.as_ref().unwrap();
-                if bd.writes.iter().any(|&(l, r)| l == LETTER_R && r == register)
-                    || (between.first && targets.contains(&(16 * between.origin as u64)))
-                    || bd.kind == Kind::BRU
-                {
+            // The callee decides: when every one of its RETs returns with RET.ABS on the
+            // register of the LEPC immediately before the call, and nothing of it writes that
+            // register, the pair is this call's return address and no MOV of the same number is
+            // one (it may be data). Otherwise the call is an ordinary one: exactly one MOV of
+            // the return address before it, reaching it in a straight line, is fixed up, as
+            // without a LEPC; none or several are refused.
+            let pair = accepted_call.contains(&k);
+            if pair {
+                lepc_pairs.push((16 * items[k - 1].origin as u64, 16 * origin as u64));
+            } else {
+                let found: Vec<usize> = movs.get(&back).cloned().unwrap_or_default();
+                if found.len() != 1 || found[0] > k {
                     return Err(Refused(format!(
-                        "the return address of the call at 0x{:x} does not reach it in a straight line",
+                        "the return address of the call at 0x{:x} is not given by exactly one MOV",
                         16 * origin
                     )));
                 }
+                let j = found[0];
+                let register = items[j].d.as_ref().unwrap().op_or(OP_RD, 255);
+                for between in &items[j + 1..k] {
+                    let bd = between.d.as_ref().unwrap();
+                    if bd.writes.iter().any(|&(l, r)| l == LETTER_R && r == register)
+                        || (between.first && targets.contains(&(16 * between.origin as u64)))
+                        || bd.kind == Kind::BRU
+                    {
+                        return Err(Refused(format!(
+                            "the return address of the call at 0x{:x} does not reach it in a straight line",
+                            16 * origin
+                        )));
+                    }
+                }
+                fixups.push((j, back as u64));
             }
-            fixups.push((j, (16 * origin + 16) as u64));
         } else if d_name.starts_with("call_abs") {
             // Through a register: LEPC + IADD3 + two MOVs
             let lepc = (k.saturating_sub(15)..k)
@@ -197,7 +256,8 @@ pub(super) fn return_addresses(
             fixups.push((values[&1], 16 * lepc_origin as u64));
         } else if d_mnemonic == "LEPC" {
             let has_call = (k + 1..std::cmp::min(items.len(), k + 16))
-                .any(|j| items[j].d.as_ref().unwrap().name.starts_with("call_abs"));
+                .any(|j| items[j].d.as_ref().unwrap().name.starts_with("call_abs"))
+                || accepted_lepc.contains(&k);
             if !has_call {
                 return Err(Refused(format!("LEPC at 0x{:x} without a call after it", 16 * origin)));
             }
@@ -209,7 +269,85 @@ pub(super) fn return_addresses(
         items[idx].fix = Some(old_offset);
     }
 
-    Ok(relocate)
+    Ok((relocate, lepc_pairs))
+}
+
+/// Whether every RET the callee can reach is `RET.ABS` on `register`, adding 0x20 (the call is
+/// two instructions after the LEPC), and nothing of the callee writes `register`. A callee that
+/// calls others, exits, or has an unreachable RET is not shown to return through it.
+fn callee_returns_through_lepc(
+    src: &[crate::decode::Decoded],
+    flow: &crate::pairing::Flow,
+    target: usize,
+    register: u32,
+) -> bool {
+    if target >= src.len() {
+        return false;
+    }
+    let mut seen = HashSet::new();
+    let mut work = vec![target];
+    let mut rets = 0;
+    while let Some(i) = work.pop() {
+        if !seen.insert(i) {
+            continue;
+        }
+        let d = &src[i];
+        if d.name.starts_with("call") || d.name == "exit_" {
+            return false;
+        }
+        if d.mnemonic == "RET" {
+            if !matches!(d.name, "ret__ABS" | "ret__ABS_UR")
+                || d.op_or(OP_RA, 255) != register
+                || d.op_or(OP_RA_OFFSET, 0) != 0x20
+            {
+                return false;
+            }
+            rets += 1;
+            if crate::pairing::unguarded(d) {
+                continue;
+            }
+            // A guarded return is one way out; the other falls through, and must be a way
+            // back through the pair too.
+        }
+        // LEPC Rd writes the pair Rd:Rd+1, and RET.ABS Ra reads the pair: a write of either
+        // half between them makes the return address wrong.
+        let upper = (register != 255).then(|| register + 1);
+        if d.writes
+            .iter()
+            .any(|&(l, r)| l == LETTER_R && r != 255 && (r == register || Some(r) == upper))
+        {
+            return false;
+        }
+        for &t in &flow.succ[i] {
+            if t < src.len() {
+                work.push(t);
+            }
+        }
+    }
+    rets > 0
+}
+
+/// The scheduling may put fillers between items: the LEPC and the call it gives the return
+/// address of must still be next to each other, or the callee returns into the filler.
+pub(super) fn lepc_pairs_adjacent(items: &[Item], pairs: &[(u64, u64)]) -> Result<(), Refused> {
+    for &(lepc_old, call_old) in pairs {
+        let lepc = items.iter().position(|item| {
+            16 * item.origin as u64 == lepc_old && item.d.as_ref().is_some_and(|d| d.mnemonic == "LEPC")
+        });
+        let call = items.iter().position(|item| {
+            16 * item.origin as u64 == call_old && item.d.as_ref().is_some_and(|d| d.name.starts_with("call_rel"))
+        });
+        match (lepc, call) {
+            (Some(l), Some(c)) if c == l + 1 => {}
+            _ => {
+                return Err(Refused(format!(
+                    "the LEPC at 0x{:x} and the call it gives the return address of are not adjacent after scheduling",
+                    lepc_old
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn immediate_of(item: &Item) -> Option<u32> {

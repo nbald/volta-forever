@@ -430,7 +430,7 @@ def completed(chart, texts, leads, anywhere):
         there[3].update(q for q in range(7) if live_in[k] >> (7 + q) & 1)
 
 
-def register_lives(mc, code, texts75, tables):
+def register_lives(mc, code, texts75, tables, problems=None, name=''):
     """The lives of registers in the sm_75 original, by the validator's own means: backward
     dataflow from the decoded reads and writes, with control flow built for REGISTER liveness
     (not the same as the predicate-lives flow).
@@ -589,6 +589,16 @@ def register_lives(mc, code, texts75, tables):
         if not d.c.name.startswith(('call', 'jcal')):
             continue
         if d.c.name.startswith('call_rel'):
+            # An adjacent LEPC gives this call its return address (what the translator links):
+            # the callee must return through the LEPC's register with RET.ABS, and a branch may
+            # not arrive at the call (it would skip the LEPC whose value the callee uses).
+            lepc_reg = None
+            if i > 0:
+                prev = (texts75[i - 1] or '')
+                prev_body = prev.split(' ', 1)[1] if prev.startswith('@') else prev
+                m_lepc = re.match(r'LEPC R(\d+)$', prev_body)
+                if m_lepc is not None and decoded[i - 1].mnemonic == 'LEPC':
+                    lepc_reg = int(m_lepc.group(1))
             body_text = (texts75[i] or '').split(' ', 1)[1] if (texts75[i] or '').startswith('@') else (texts75[i] or '')
             m_hex = HEX.search(body_text)
             if not m_hex:
@@ -665,11 +675,28 @@ def register_lives(mc, code, texts75, tables):
                         continue          # RET ends the walk
                     if 0 <= t < n:
                         work.append(t)
+            # The LEPC's register is the callee's return address when the callee's RETs are
+            # RET.ABS on it and nothing of the callee writes it (a routine that calls others is
+            # not checked here: those calls may write the register; it must save and restore it
+            # around them, which this does not follow).
+            lepc_ok = False
+            if lepc_reg is not None and simple:
+                rets = [decoded[k] for k in body if decoded[k].mnemonic == 'RET']
+                written = any(any(l == 'R' and r != 255 and r in (lepc_reg, lepc_reg + 1) for l, r in decoded[k].writes) for k in body)
+                returns_via_lepc = bool(rets) and not written and all(
+                    r.c.name in ('ret__ABS', 'ret__ABS_UR') and r.ops.get('Ra') == lepc_reg
+                    and r.ops.get('Ra_offset') == 0x20 for r in rets)
+                if returns_via_lepc and i in branch_targets and problems is not None:
+                    problems.append('%s+0x%x: a branch arrives at a call whose callee returns through R%d, the register of the LEPC before it, so a path skips the LEPC' % (name[:40], 16 * i, lepc_reg))
+                # When the callee does not return through the LEPC's register, the call is an
+                # ordinary one: its return address is a MOV (the translator's rule), and the
+                # LEPC before it is not this call's. Nothing is wrong with the pair as such.
+                lepc_ok = returns_via_lepc and i not in branch_targets
             # Check exact: all RET.REL name mov_reg (or a copy of it), nothing
             # writes mov_reg, no calls. A RET.REL may name R' where the last write
             # of R' before the RET in a straight line is `MOV R', mov_reg`; if the
             # RET reads a pair (R':R'+1), the upper half must be `MOV R'+1, 0x0`.
-            exact = simple and mov_reg is not None
+            exact = simple and (mov_reg is not None or lepc_ok)
             inexact_reason = None
             if exact:
                 # For each RET, either (a) no instruction in the routine writes mov_reg,
@@ -2056,7 +2083,11 @@ def schedule(mc, code, highest, sequences=frozenset(), borrowed=frozenset(), add
         # issued after it gives back. It keeps the R2P nine cycles into its block: far from any
         # writer of a predicate that ran before the block on a path the check above does not
         # follow.)
-        if d is not None and d.mnemonic == 'R2P' and d.ops.get('Ra', 0) > highest and 'Sb' in d.ops:
+        # (RZ is 255, not a register of the translation: a program's own R2P that restores from
+        # RZ, or clears predicates, is not one of the translation's restores. cuDNN 9.24's sm_75
+        # kernels have such R2Ps; they were counted as the translation's, 1,040 times.)
+        if (d is not None and d.mnemonic == 'R2P' and d.ops.get('Ra', 0) > highest
+                and d.ops.get('Ra', 0) != 255 and 'Sb' in d.ops):
             given, distance = d.ops['Sb'] & 0x7f, 0
             for j in range(k - 1, -1, -1):
                 distance += (words[j] >> USCHED) & 15
@@ -3386,7 +3417,7 @@ def main():
             kinds['(lives) branches through a register without a list: taken to lead anywhere'] += len(anywhere)
         # Register liveness of the sm_75 original, by the validator's own means (for borrowed
         # register checks: rules 1 through 6). None when the flow is not known.
-        reg_lives = register_lives(mc, a.data, ta, tables.get(name, {}))
+        reg_lives = register_lives(mc, a.data, ta, tables.get(name, {}), problems, name)
         # Predicate lives of the validator's own (P0-P6), by backward dataflow on the original.
         pred_own = predicate_lives(mc, a.data, ta, tables.get(name, {}))
         # nvdisasm prints a relative target as an address counted from the start of what it is given:
@@ -3397,6 +3428,23 @@ def main():
         for new, old, what in listing:
             new_of.setdefault(old, new)
         new_of[len(a.data)] = len(b.data)
+        # A direct call whose return address is the program counter of the LEPC immediately
+        # before it: both move with the code, so they must stay adjacent in the result (the
+        # callee returns to what follows the call, and the LEPC's value is the call's address).
+        for k in range(len(ta) - 1):
+            first = (ta[k] or '')
+            second = (ta[k + 1] or '')
+            first = first.split(' ', 1)[1] if first.startswith('@') else first
+            second = second.split(' ', 1)[1] if second.startswith('@') else second
+            if re.match(r'LEPC R\d+$', first) and second.startswith('CALL.REL'):
+                old = 16 * k
+                if new_of.get(old, -1) + 16 != new_of.get(old + 16, -2):
+                    problems.append('%s+0x%x: the LEPC and the call it gives the return address of are not adjacent in the result' % (name[:40], old))
+                else:
+                    moved_text = tb[new_of[old] // 16] or ''
+                    moved_text = moved_text.split(' ', 1)[1] if moved_text.startswith('@') else moved_text
+                    if moved_text != first:
+                        problems.append('%s+0x%x: the LEPC of the call is not the instruction it was (the callee returns through its register)' % (name[:40], old))
         place, highest, pool = {}, 0, set()
         borrowed_regs = set()           # registers <= highest that the translation uses (homes and pool)
         # The ordinary predicate an instruction has for a uniform one: {(uniform predicate, old

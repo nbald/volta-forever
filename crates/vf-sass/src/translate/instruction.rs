@@ -101,6 +101,7 @@ pub(super) fn translate_one(ctx: &mut Ctx, i: usize, d: &Decoded) -> Result<Vec<
     if matches!(name, "ldg__sImmOffset" | "ld__sImmOffset") && d.op_or(OP_SP2, 0) != 0 {
         let cleared = put_operand(d, OP_SP2, 0, 75)?;
         if ctx.dec70.decode(cleared).is_some() {
+            let cleared = without_batch(name, d, cleared)?;
             return Ok(vec![Item::new(cleared, i, "without its cache hint", true)]);
         }
     }
@@ -452,4 +453,16 @@ fn translate_uldc_at_index(ctx: &mut Ctx, i: usize, d: &Decoded, wait: u128) -> 
         Item::new(load | wait, i, "constant at an index", true),
         Item::new(arrived, i, "until it is there", true),
     ])
+}
+
+/// `word`, a load the translation changed, with the batch of its original scheduling table
+/// cleared: what the translation changed names no batch (its schedule is the translation's).
+/// The wait hint of the table (its low five bits) stays.
+pub(super) fn without_batch(class_name: &str, d: &Decoded, word: u128) -> Result<u128, Refused> {
+    let table = "TABLES_opex_0(batch_t,usched_info)";
+    let value = d.op_or_name(table, 0);
+    if value >> 5 == 0 {
+        return Ok(word);
+    }
+    put_operand_by_class(class_name, word, table, u64::from(value & 31), false)
 }

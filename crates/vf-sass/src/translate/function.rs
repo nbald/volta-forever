@@ -530,8 +530,9 @@ pub(super) fn translate_function(
         });
     }
 
-    let relocate = return_addresses(&mut items, &targets, fd)?;
+    let (relocate, lepc_pairs) = return_addresses(&mut items, &targets, fd)?;
     schedule(&mut items, &targets)?;
+    super::return_addr::lepc_pairs_adjacent(&items, &lepc_pairs)?;
     let (code, new_of, count) = finish(&mut items, &fd.src, ctx.next_register, ctx.dec70)?;
     let frame_bytes = ctx.borrow.as_ref().map_or(0, |b| b.frame_bytes);
     let lives = lives(predicates, hold_at, ctx.borrow.as_deref(), &ctx.given_at, &ctx.spilled);
