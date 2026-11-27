@@ -1,8 +1,10 @@
 //! Tests for the translator: scheduling, placement, borrowed registers, predicate
 //! assignment, and assembly of the instructions the translation builds.
+use std::collections::HashSet;
+
 use super::borrowed::Borrowed;
-use super::context::pick;
-use super::parse::{FuncData, placement};
+use super::context::{entries, pick};
+use super::parse::{FuncData, parse_function, placement};
 use super::*;
 use crate::assemble;
 use crate::decode::{Decoder, Kind, LETTER_P, LETTER_R, LETTER_U};
@@ -78,7 +80,7 @@ fn items_of(list: &[Given]) -> Vec<Item> {
             };
             let mut item = Item::new(word, i, what, changed);
             item.first = true;
-            item.d = Some(dec70.decode(word).expect(name));
+            item.d = Some(dec70.decode_arc(word).expect(name));
             if what == "restore" {
                 let mask = item.d.as_ref().unwrap().op_or(OP_SB, 0);
                 item.more_writes
@@ -635,9 +637,9 @@ fn free_at_skips_given() {
     let b = Borrowed {
         top: 10,
         highest: 10,
-        busy: vec![regset_empty()],
+        busy: std::sync::Arc::new(vec![regset_empty()]),
         taken: vec![regset_empty()],
-        touch: vec![regset_empty()],
+        touch: std::sync::Arc::new(vec![regset_empty()]),
         never: regset_empty(),
         homes: HashMap::new(),
         spans: HashMap::new(),
@@ -646,7 +648,7 @@ fn free_at_skips_given() {
         slots: HashMap::new(),
         predicate_slots: HashMap::new(),
         frame_bytes: 0,
-        depth: vec![None],
+        depth: std::sync::Arc::new(vec![None]),
         r1_fixed: true,
         room: false,
         from_r1: false,
@@ -679,9 +681,9 @@ fn free_at_returns_none_when_full() {
     let b = Borrowed {
         top: 20,
         highest: 20,
-        busy: vec![busy],
+        busy: std::sync::Arc::new(vec![busy]),
         taken: vec![regset_empty()],
-        touch: vec![regset_empty()],
+        touch: std::sync::Arc::new(vec![regset_empty()]),
         never: regset_empty(),
         homes: HashMap::new(),
         spans: HashMap::new(),
@@ -690,7 +692,7 @@ fn free_at_returns_none_when_full() {
         slots: HashMap::new(),
         predicate_slots: HashMap::new(),
         frame_bytes: 0,
-        depth: vec![None],
+        depth: std::sync::Arc::new(vec![None]),
         r1_fixed: true,
         room: false,
         from_r1: false,
@@ -1506,7 +1508,7 @@ fn a_result_of_double_precision_is_read_no_earlier_than_volta_reads_one() {
             .map(|(i, word)| {
                 let mut item = Item::new(word, i, "same", changed);
                 item.first = true;
-                item.d = Some(decoder.decode(word).unwrap());
+                item.d = Some(decoder.decode_arc(word).unwrap());
                 item
             })
             .collect();
@@ -1533,7 +1535,7 @@ fn a_result_of_double_precision_is_read_no_earlier_than_volta_reads_one() {
             .map(|(i, word)| {
                 let mut item = Item::new(word, i, "same", true);
                 item.first = true;
-                item.d = Some(decoder.decode(word).unwrap());
+                item.d = Some(decoder.decode_arc(word).unwrap());
                 item
             })
             .collect();
@@ -1558,7 +1560,7 @@ fn a_result_of_double_precision_is_read_no_earlier_than_volta_reads_one() {
                 let mut item = Item::new(word, i, "same", true);
                 item.anew = anew;
                 item.first = true;
-                item.d = Some(decoder.decode(word).unwrap());
+                item.d = Some(decoder.decode_arc(word).unwrap());
                 item
             })
             .collect();
@@ -1577,4 +1579,299 @@ fn a_result_of_double_precision_is_read_no_earlier_than_volta_reads_one() {
     // A writer earlier in the code that goes on to that place.
     let through = ends(&[with_stall(board(DSETP, 0), 2, false), nop, nop], &[32], true);
     assert_eq!(through[0] + through[1], 15, "{through:?}");
+}
+
+#[test]
+fn parallel_cubin_translation_matches_single_threaded() {
+    let cubins: [(&str, &[u8]); 2] = [
+        (
+            "k_pairs",
+            include_bytes!("../../../../tests/kernels/k_pairs.135.sm75.cubin"),
+        ),
+        (
+            "k_groups",
+            include_bytes!("../../../../tests/kernels/k_groups.135.sm75.cubin"),
+        ),
+    ];
+    let opts = Options::default();
+    for (label, bytes) in cubins {
+        let single = super::cubin::translate_with_threads(bytes, true, &opts, Some(1))
+            .unwrap_or_else(|e| panic!("{label} T=1 failed: {e}"));
+        let multi = super::cubin::translate_with_threads(bytes, true, &opts, Some(4))
+            .unwrap_or_else(|e| panic!("{label} T=4 failed: {e}"));
+        assert_eq!(multi.bytes, single.bytes, "{label}: cubin bytes differ");
+        assert_eq!(multi.map, single.map, "{label}: map differs");
+        assert_eq!(multi.lives, single.lives, "{label}: lives differ");
+        assert_eq!(multi.report, single.report, "{label}: report differs");
+    }
+}
+
+/// At level 3 every register of a matrix sequence is taken at its instruction, the lane too, and
+/// read there (`S2R SR_LANEID`, "lane" in the map): also at an instruction around which nothing
+/// else is put (no uniform register in memory, no room made, the frame empty). `t_stored_plain` of
+/// k_stored.cu with any instruction on uniform registers made a NOP, 128 registers and a NOP that
+/// writes R100 (registers that hold nothing), at VF_BORROW=3 (level 3 first): each of its matrix
+/// loads reads the lane.
+#[test]
+fn at_level_3_each_matrix_instruction_reads_the_lane() {
+    let original = include_bytes!("../../../../tests/kernels/k_stored.135.sm75.cubin");
+    let name = "t_stored_plain";
+    let mut input = crate::elf::Elf::parse(original).unwrap();
+    let section = input.section(&format!(".text.{name}")).unwrap();
+    let info = input.sections[section].info;
+    input.sections[section].info = (128 << 24) | (info & 0x00ff_ffff);
+    let mut dec75 = Decoder::new(75);
+    let mut loads = Vec::new();
+    let mut made_nop = Vec::new();
+    for (i, bytes) in input.sections[section]
+        .data
+        .as_chunks_mut::<16>()
+        .0
+        .iter_mut()
+        .enumerate()
+    {
+        let d = dec75.decode(u128::from_le_bytes(*bytes)).unwrap();
+        let uniform = d
+            .reads
+            .iter()
+            .any(|&(l, _, _)| l == LETTER_U || l == crate::decode::LETTER_Q)
+            || d.writes
+                .iter()
+                .any(|&(l, _)| l == LETTER_U || l == crate::decode::LETTER_Q);
+        if uniform || d.mnemonic == "NOP" {
+            bytes.copy_from_slice(&NOP.to_le_bytes());
+            made_nop.push(i);
+        } else if d.mnemonic == "LDSM" {
+            loads.push(16 * i as u64);
+        }
+    }
+    assert!(!loads.is_empty());
+    // Registers that hold nothing for the sequences to take: one of the NOPs writes R100.
+    let mov = assemble::assemble_int("mov__RCR_RC", &[("Rd", 100)]).unwrap();
+    let k = made_nop[0];
+    input.sections[section].data[16 * k..16 * (k + 1)].copy_from_slice(&mov.to_le_bytes());
+    let opts = Options {
+        borrow: 3,
+        ..Options::default()
+    };
+    let result = translate_with_options(&input.write(), true, &opts).unwrap();
+    let report = result.report.iter().find(|f| f.name == name).unwrap();
+    assert_eq!(report.refused, None);
+    let map = result.map.unwrap();
+    for at in loads {
+        assert!(
+            map.iter()
+                .any(|(f, _, old, what)| f == name && *old == at && what == "lane"),
+            "nothing reads the lane for the matrix load at 0x{at:x}"
+        );
+    }
+}
+
+/// The 16-byte word of a branch, always taken, to `16 * target` from `16 * at` (`at` in its own
+/// function: its relative operand put as `reference/translate.py` reads it).
+fn branch(dec75: &mut Decoder, at: usize, target: usize) -> u128 {
+    // BRA to the next instruction, under no guard.
+    let word: u128 = 0x000fc200038000000000000000007947;
+    let d = dec75.decode(word).unwrap();
+    assert_eq!(d.mnemonic, "BRA");
+    let (fid, scale) = super::util::find_relative(&d, 75).unwrap();
+    let distance = (16 * target as i64 - 16 * at as i64 - 16) / scale as i64;
+    let width = crate::field::width(fid);
+    crate::field::put(fid, word, (distance as u64) & ((1u64 << width) - 1))
+}
+
+/// The functions of k_pairs.cu whose products the translation makes in pairs.
+fn paired_of(data: &[u8]) -> Vec<String> {
+    let result = translate_with_options(data, false, &Options::default()).unwrap();
+    result
+        .report
+        .iter()
+        .filter(|f| f.paired)
+        .map(|f| f.name.clone())
+        .collect()
+}
+
+/// A branch to the end of its function, past its last instruction, leaves the ways through the
+/// function unknown, as `reference/pairing.py` has it (and `main` had it): no pairs, no borrowed
+/// registers. In k_pairs.cu the last instruction of each function with pairs that ends on a NOP
+/// (after its end) made such a branch.
+#[test]
+fn a_branch_to_the_end_of_its_function_leaves_the_ways_unknown() {
+    let original = include_bytes!("../../../../tests/kernels/k_pairs.135.sm75.cubin");
+    let before = paired_of(original);
+    let mut input = crate::elf::Elf::parse(original).unwrap();
+    let mut dec75 = Decoder::new(75);
+    let mut changed = Vec::new();
+    for name in &before {
+        let section = input.section(&format!(".text.{name}")).unwrap();
+        let code = &mut input.sections[section].data;
+        let n = code.len() / 16;
+        let last = u128::from_le_bytes(code[16 * (n - 1)..].try_into().unwrap());
+        if dec75.decode(last).unwrap().mnemonic != "NOP" {
+            continue;
+        }
+        let word = branch(&mut dec75, n - 1, n);
+        code[16 * (n - 1)..].copy_from_slice(&word.to_le_bytes());
+        let fd = parse_function(&mut dec75, name, code, 255, vec![]).unwrap();
+        let flow = crate::pairing::Flow::new(&fd.src, &fd.tables, &entries(&fd));
+        assert!(!flow.known, "{name}");
+        assert!(
+            crate::pairing::plan(&fd.src, &fd.tables, &entries(&fd)).is_none(),
+            "{name}"
+        );
+        assert!(Borrowed::new(&fd, false, None).is_err(), "{name}");
+        changed.push(name.clone());
+    }
+    assert!(!changed.is_empty());
+    let after = paired_of(&input.write());
+    assert!(changed.iter().all(|name| !after.contains(name)), "{after:?}");
+}
+
+/// The window in which a product finds the other of its pair goes on while the next instruction
+/// is not an entry of the function and the one before it is plain (`reference/pairing.py`,
+/// `attempt`): it is not cut where another way comes in that is not among the entries. In
+/// k_pairs.cu, a branch from after the end of the code (reached from nowhere) to the second
+/// product of a pair, with the entries as they were: the pairs stay.
+#[test]
+fn the_pair_window_is_cut_by_entries_only() {
+    let original = include_bytes!("../../../../tests/kernels/k_pairs.135.sm75.cubin");
+    let elf = crate::elf::Elf::parse(original).unwrap();
+    let mut dec75 = Decoder::new(75);
+    let mut tried = 0;
+    for section in elf.sections.iter().filter(|s| s.name.starts_with(".text.")) {
+        let name = &section.name[".text.".len()..];
+        let fd = parse_function(&mut dec75, name, &section.data, 255, vec![]).unwrap();
+        let entered = entries(&fd);
+        let Some(plan) = crate::pairing::plan(&fd.src, &fd.tables, &entered) else {
+            continue;
+        };
+        let n = fd.src.len();
+        let last = n - 1;
+        if fd.src[last].mnemonic != "NOP" {
+            continue;
+        }
+        for (&j, site) in &plan.sites {
+            if site.partner > j {
+                continue;
+            }
+            let mut src = fd.src.clone();
+            let word = branch(&mut dec75, last, j);
+            src[last] = dec75.decode(word).unwrap();
+            let paired = crate::pairing::plan(&src, &fd.tables, &entered);
+            assert_eq!(
+                paired.map(|p| p.sites.keys().copied().collect::<Vec<_>>()),
+                Some(plan.sites.keys().copied().collect::<Vec<_>>()),
+                "{name}: a way into the product at 0x{:x}",
+                16 * j
+            );
+            tried += 1;
+        }
+    }
+    assert!(tried > 0);
+}
+
+/// Where the ways through a function are not known (here no entries are: a branch through a
+/// register without a table gives none), there is no plan, and the flow is asked nothing more
+/// (`debug_assert` of the facts that pairing needs came before that check, and panicked).
+#[test]
+fn no_plan_where_the_ways_are_unknown() {
+    let original = include_bytes!("../../../../tests/kernels/k_pairs.135.sm75.cubin");
+    let elf = crate::elf::Elf::parse(original).unwrap();
+    let mut dec75 = Decoder::new(75);
+    let mut planned = 0;
+    for section in elf.sections.iter().filter(|s| s.name.starts_with(".text.")) {
+        let fd = parse_function(&mut dec75, &section.name[".text.".len()..], &section.data, 255, vec![]).unwrap();
+        if crate::pairing::plan(&fd.src, &fd.tables, &entries(&fd)).is_some() {
+            planned += 1;
+            assert!(
+                crate::pairing::plan(&fd.src, &fd.tables, &None).is_none(),
+                "{}",
+                section.name
+            );
+        }
+    }
+    assert!(planned > 0);
+}
+
+/// What a function calls is read from every section of attributes of its name (`.nv.info.NAME`,
+/// attribute 0x0f), as `main` and `reference/translate.py` read it. In k_pairs.cu, a second
+/// `.nv.info.` section of one function says it calls another, which is refused (its first word is
+/// of no sm_75 class): the one that calls it is refused with it.
+#[test]
+fn every_section_of_attributes_says_what_a_function_calls() {
+    let original = include_bytes!("../../../../tests/kernels/k_pairs.135.sm75.cubin");
+    let mut elf = crate::elf::Elf::parse(original).unwrap();
+    let names: Vec<String> = elf
+        .sections
+        .iter()
+        .filter_map(|s| s.name.strip_prefix(".text.").map(str::to_string))
+        .collect();
+    assert!(names.len() >= 2);
+    let (caller, callee) = (&names[0], &names[1]);
+    let at = elf.section(&format!(".text.{callee}")).unwrap();
+    elf.sections[at].data[..16].copy_from_slice(&[0xff; 16]);
+    let symbols = elf.symbols().unwrap();
+    let symbol = symbols
+        .iter()
+        .position(|s| s.name == *callee && s.info & 0xf == 2)
+        .unwrap() as u32;
+    let info = elf.section(&format!(".nv.info.{caller}")).unwrap();
+    let mut second = elf.sections[info].clone();
+    second.data = [4u8, 0x0f, 4, 0].into_iter().chain(symbol.to_le_bytes()).collect();
+    elf.sections.push(second);
+    let mut data = elf.write();
+    // (`write` keeps the header's count of sections.)
+    data[0x3c..0x3e].copy_from_slice(&(elf.sections.len() as u16).to_le_bytes());
+    let result = translate_with_options(&data, false, &Options::default()).unwrap();
+    let why = |name: &str| result.report.iter().find(|f| f.name == name).unwrap().refused.clone();
+    assert!(why(callee).is_some());
+    assert_eq!(
+        why(caller).as_deref(),
+        Some("a function it calls, or that calls it, is refused")
+    );
+}
+
+/// An unmodified compiler-emitted Triton `sm_75` matmul cubin (`tl.dot` 64x32x16 fp16->fp32,
+/// compiled with `TRITON_DISABLE_LINE_INFO=1`) reaches the level-3 fast path with no uniform
+/// registers in memory and no room made at `VF_BORROW=3`. Before the `empty_lane` fix, every
+/// `S2R SR_LANEID` before its matrix sequences was dropped (`0` of `4` `"lane"` entries).
+#[test]
+fn unmodified_triton_dot_reads_lane_at_level_3() {
+    let original = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/kernels/translate/triton_dot.sm_75.cubin"
+    ));
+    let opts = Options {
+        borrow: 3,
+        ..Options::default()
+    };
+    let result = translate_with_options(original, true, &opts).unwrap();
+    let report = result.report.iter().find(|f| f.name == "k_dot").unwrap();
+    assert_eq!(report.refused, None);
+    let map = result.map.unwrap();
+    let mut lane_pcs = std::collections::HashSet::new();
+    let mut group_pcs = std::collections::HashSet::new();
+    for (fn_name, _dst, src, role) in &map {
+        if fn_name != "k_dot" {
+            continue;
+        }
+        if role == "lane" {
+            lane_pcs.insert(*src);
+        } else if role == "group" {
+            group_pcs.insert(*src);
+        }
+    }
+    assert_eq!(
+        lane_pcs.len(),
+        4,
+        "expected 4 per-instruction S2R SR_LANEID reads at VF_BORROW=3, got {}",
+        lane_pcs.len()
+    );
+    assert!(!group_pcs.is_empty());
+    for pc in group_pcs {
+        assert!(
+            lane_pcs.contains(&pc),
+            "nothing reads the lane for matrix instruction at 0x{pc:x}"
+        );
+    }
 }

@@ -9,6 +9,7 @@ use crate::generated::rules::*;
 use crate::generated::special::SCHEDULING;
 
 /// Find a pre-computed rule by sm_75 class name, sm_70 class name, and drop key.
+#[inline]
 pub fn find_rule(sm75_name: &str, sm70_name: &str, drop_key: &str) -> Option<usize> {
     RULES
         .iter()
@@ -16,6 +17,7 @@ pub fn find_rule(sm75_name: &str, sm70_name: &str, drop_key: &str) -> Option<usi
 }
 
 /// Find the rule_of target for an sm_75 class (by class ID).
+#[inline]
 pub fn rule_of_target(sm75_class_id: u16) -> Option<&'static str> {
     RULE_OF
         .iter()

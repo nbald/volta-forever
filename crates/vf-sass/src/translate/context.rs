@@ -1308,35 +1308,52 @@ pub(super) fn stand_ins(fd: &FuncData) -> Result<Predicates, Refused> {
     // The lives: instructions where a uniform predicate holds something, joined where the value
     // goes from one to the next. (first instruction, predicate, instructions in order.)
     let mut lives: Vec<(usize, u32, Vec<usize>)> = Vec::new();
+    let mut parent = vec![0usize; n];
+    let mut present = vec![false; n];
+    let mut root_part = vec![usize::MAX; n];
+    fn find_root(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            let up = parent[parent[x]];
+            parent[x] = up;
+            x = up;
+        }
+        x
+    }
     for &q in &fd.uniform_predicates {
         let bit = 7 + q;
         let alive: Vec<usize> = (0..n).filter(|&i| busy[i] >> bit & 1 != 0).collect();
-        let mut parent: HashMap<usize, usize> = alive.iter().map(|&i| (i, i)).collect();
-        fn find(parent: &mut HashMap<usize, usize>, mut x: usize) -> usize {
-            while parent[&x] != x {
-                let up = parent[&parent[&x]];
-                parent.insert(x, up);
-                x = up;
-            }
-            x
+        for &i in &alive {
+            parent[i] = i;
+            present[i] = true;
         }
         for &i in &alive {
+            if live.live_out[i] >> bit & 1 == 0 {
+                continue;
+            }
             for &j in &live.successors[i] {
-                if parent.contains_key(&j) && live.live_out[i] >> bit & 1 != 0 && live.live_in[j] >> bit & 1 != 0 {
-                    let (a, b) = (find(&mut parent, i), find(&mut parent, j));
-                    parent.insert(a, b);
+                if present[j] && live.live_in[j] >> bit & 1 != 0 {
+                    let a = find_root(&mut parent, i);
+                    let b = find_root(&mut parent, j);
+                    parent[a] = b;
                 }
             }
         }
-        let mut parts: Vec<(usize, Vec<usize>)> = Vec::new();
+        let mut parts: Vec<Vec<usize>> = Vec::new();
         for &i in &alive {
-            let root = find(&mut parent, i);
-            match parts.iter_mut().find(|(r, _)| *r == root) {
-                Some((_, part)) => part.push(i),
-                None => parts.push((root, vec![i])),
+            let root = find_root(&mut parent, i);
+            if root_part[root] == usize::MAX {
+                root_part[root] = parts.len();
+                parts.push(vec![i]);
+            } else {
+                parts[root_part[root]].push(i);
             }
         }
-        lives.extend(parts.into_iter().map(|(_, part)| (part[0], q, part)));
+        for &i in &alive {
+            present[i] = false;
+            root_part[parent[i]] = usize::MAX;
+            root_part[i] = usize::MAX;
+        }
+        lives.extend(parts.into_iter().map(|part| (part[0], q, part)));
     }
     lives.sort();
 
@@ -1386,16 +1403,18 @@ pub(super) fn stand_ins(fd: &FuncData) -> Result<Predicates, Refused> {
     let mut later: Vec<(u32, Vec<usize>)> = Vec::new();
     for (q, part) in hard {
         let (i0, i1) = (part[0], part[part.len() - 1]);
-        let touched = (i0..=i1).fold(0u32, |touched, i| {
-            touched | ((live.defs[i] | live.uses[i]) as u32 & 0x7f) | taken_at[i]
-        });
-        let p = pick(touched, &order_up, slow, never);
         let run = part.len() == i1 - i0 + 1 && !(i0 + 1..=i1).any(|i| targets[i]) && (i0..=i1).all(straight);
-        if p.is_none() || !run {
+        if !run {
             later.push((q, part));
             continue;
         }
-        let p = p.unwrap();
+        let touched = (i0..=i1).fold(0u32, |touched, i| {
+            touched | ((live.defs[i] | live.uses[i]) as u32 & 0x7f) | taken_at[i]
+        });
+        let Some(p) = pick(touched, &order_up, slow, never) else {
+            later.push((q, part));
+            continue;
+        };
         let k = slot(i0, i1);
         give(&mut out, &mut taken_at, q, &part, p, true);
         out.saves.entry(i0).or_default().push((k, p));

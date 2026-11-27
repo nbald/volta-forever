@@ -1,22 +1,27 @@
 //! Cubin-level translation: parse the ELF, group functions by call edges, translate
 //! each group, rewrite attributes and relocations, and re-tag for sm_70.
 
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 
 use crate::assemble;
 use crate::decode::Decoder;
 use crate::elf::Elf;
+use crate::fast::{FastMap, FastSet};
 use crate::generated::special::*;
 
 use super::attributes::{check_attributes, find_exits, rewrite_attributes, strip_attributes, strip_attrs_by_kind};
-use super::borrowed::Borrowed;
+use super::borrowed::BorrowedPrepared;
 use super::context::{Predicates, entries, stand_ins};
 use super::function::{follow, translate_function};
+use super::parallel::{effective_threads, par_map_init};
 use super::parse::{FuncData, parse_function, placement, tables_of};
 use super::{
     FunctionReport, LifeEntry, MapEntry, Options, Refused, Relocation, STAY, TRAP, TransResult, TranslateResult,
     with_stall,
 };
+
+const PARALLEL_CODE_BYTES: usize = 64 * 1024;
 
 /// Translate an sm_75 or supported sm_80 cubin to sm_70.
 pub fn translate(data: &[u8], want_map: bool) -> Result<TranslateResult, String> {
@@ -25,50 +30,96 @@ pub fn translate(data: &[u8], want_map: bool) -> Result<TranslateResult, String>
 
 /// Translate an sm_75 or supported sm_80 cubin to sm_70 with the given options.
 pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Result<TranslateResult, String> {
-    let mut dec75 = Decoder::new(75);
-    let mut dec70 = Decoder::new(70);
+    translate_with_threads(data, want_map, opts, None)
+}
+
+pub(super) fn translate_with_threads(
+    data: &[u8],
+    want_map: bool,
+    opts: &Options,
+    forced_threads: Option<usize>,
+) -> Result<TranslateResult, String> {
     let mut e = Elf::parse(data)?;
     let arch = super::ampere::source(&e.header)?;
-    let symbols = e.symbols()?;
+    let mut symbols = e.symbols()?;
+    let sec_map = e.section_index_map();
+    let callgraph_sec = sec_map.get(".nv.callgraph").copied();
+    let nv_info_sec = sec_map.get(".nv.info").copied();
+    drop(sec_map);
 
-    let texts: Vec<usize> = e
-        .sections
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| s.name.starts_with(".text.") && s.stype == 1)
-        .map(|(i, _)| i)
-        .collect();
-    for (k, &si) in texts.iter().enumerate() {
-        if texts[..k]
-            .iter()
-            .any(|&other| e.sections[other].name == e.sections[si].name)
+    let mut texts: Vec<usize> = Vec::new();
+    let mut text_names: FastSet<&str> = FastSet::default();
+    let mut text_slot: FastMap<usize, usize> = FastMap::default();
+    let mut text_by_name: FastMap<&str, usize> = FastMap::default();
+
+    for (i, s) in e.sections.iter().enumerate() {
+        if let Some(fn_name) = s.name.strip_prefix(".text.")
+            && s.stype == 1
         {
-            return Err("two sections of code with the same name".into());
+            if !text_names.insert(s.name.as_str()) {
+                return Err("two sections of code with the same name".into());
+            }
+            let slot = texts.len();
+            texts.push(i);
+            text_slot.insert(i, slot);
+            text_by_name.insert(fn_name, slot);
         }
     }
 
-    // Union-find for call groups
-    let mut group: HashMap<usize, usize> = texts.iter().map(|&i| (i, i)).collect();
-    fn find(group: &mut HashMap<usize, usize>, mut x: usize) -> usize {
-        while group[&x] != x {
-            x = group[&x];
+    let n_texts = texts.len();
+    let mut info_sec: Vec<Option<usize>> = vec![None; n_texts];
+    // Every section of attributes of a function's name, for what it calls (the first one is
+    // the function's for everything else, as `Elf::section` finds it).
+    let mut info_secs: Vec<Vec<usize>> = vec![Vec::new(); n_texts];
+    let mut const2_sec: Vec<Option<usize>> = vec![None; n_texts];
+    for (i, s) in e.sections.iter().enumerate() {
+        if let Some(fn_name) = s.name.strip_prefix(".nv.info.") {
+            if let Some(&slot) = text_by_name.get(fn_name) {
+                info_sec[slot].get_or_insert(i);
+                info_secs[slot].push(i);
+            }
+        } else if let Some(fn_name) = s.name.strip_prefix(".nv.constant2.")
+            && let Some(&slot) = text_by_name.get(fn_name)
+        {
+            const2_sec[slot].get_or_insert(i);
+        }
+    }
+
+    let mut symbols_by_text: Vec<Vec<usize>> = vec![Vec::new(); n_texts];
+    let mut by_symbol: FastMap<usize, usize> = FastMap::default();
+    let mut entry_secs: FastSet<usize> = FastSet::default();
+    let mut entered_inside: Vec<bool> = vec![false; n_texts];
+
+    for (sym_idx, sym) in symbols.iter().enumerate() {
+        let shndx = sym.shndx as usize;
+        if let Some(&slot) = text_slot.get(&shndx) {
+            symbols_by_text[slot].push(sym_idx);
+            by_symbol.insert(sym_idx, slot);
+            if sym.info & 0xf == 2 {
+                if sym.other & 0x10 != 0 {
+                    entry_secs.insert(shndx);
+                }
+                if sym.info >> 4 == 1 && sym.value != 0 {
+                    entered_inside[slot] = true;
+                }
+            }
+        }
+    }
+
+    // Union-find over `0..n_texts` for call groups.
+    let mut group_parent: Vec<usize> = (0..n_texts).collect();
+    fn find_group(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            let up = parent[parent[x]];
+            parent[x] = up;
+            x = up;
         }
         x
     }
-    let by_symbol: HashMap<usize, usize> = symbols
-        .iter()
-        .enumerate()
-        .filter(|(_, sym)| group.contains_key(&(sym.shndx as usize)))
-        .map(|(i, sym)| (i, sym.shndx as usize))
-        .collect();
 
-    // Relocations: the driver, or a linker, writes addresses into the instructions and the data
-    // they name once it knows them. Those on code are kept by the function they are on (`follow`);
-    // the functions whose code one names, and the functions that hold such a one, are noted: the
-    // place it names moves with the translation, and nothing here carries it over. (Those of the
-    // debug sections are for a debugger.)
-    let mut relocations: HashMap<usize, Vec<Relocation>> = HashMap::new();
-    let (mut holders, mut named) = (HashSet::new(), HashSet::new());
+    let mut relocations: FastMap<usize, Vec<Relocation>> = FastMap::default();
+    let mut holders: FastSet<usize> = FastSet::default();
+    let mut named: FastSet<usize> = FastSet::default();
     for (section, s) in e.sections.iter().enumerate() {
         let on = s.info as usize;
         if (s.stype != 4 && s.stype != 9) || on >= e.sections.len() {
@@ -78,14 +129,12 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
             continue;
         }
         let step = if s.stype == 4 { 24 } else { 16 };
+        let on_is_text = text_slot.contains_key(&on);
         for at in (0..s.data.len().saturating_sub(step - 1)).step_by(step) {
             let offset = u64::from_le_bytes(s.data[at..at + 8].try_into().unwrap());
             let info = u64::from_le_bytes(s.data[at + 8..at + 16].try_into().unwrap());
-            let names = symbols
-                .get((info >> 32) as usize)
-                .map(|sym| sym.shndx as usize)
-                .filter(|place| group.contains_key(place));
-            if group.contains_key(&on) {
+            let names = by_symbol.get(&((info >> 32) as usize)).map(|&slot| texts[slot]);
+            if on_is_text {
                 relocations.entry(on).or_default().push(Relocation {
                     section,
                     at,
@@ -102,9 +151,8 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
         }
     }
 
-    // Edges from .nv.callgraph
-    let mut edges: Vec<(usize, usize)> = Vec::new();
-    if let Some(gi) = e.section(".nv.callgraph") {
+    // Edges from .nv.callgraph and .nv.info.* attribute 0x0f.
+    if let Some(gi) = callgraph_sec {
         let gdata = &e.sections[gi].data;
         let mut at = 0;
         while at + 8 <= gdata.len() {
@@ -113,229 +161,283 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
             if b >= 0
                 && let (Some(&sa), Some(&sb)) = (by_symbol.get(&a), by_symbol.get(&(b as usize)))
             {
-                edges.push((sa, sb));
+                let fa = find_group(&mut group_parent, sa);
+                let fb = find_group(&mut group_parent, sb);
+                if fa != fb {
+                    group_parent[fa] = fb;
+                }
             }
             at += 8;
         }
     }
-    // Edges from .nv.info.* attribute 0x0f
-    for si in 0..e.sections.len() {
-        if !e.sections[si].name.starts_with(".nv.info.") {
-            continue;
-        }
-        let fn_name = e.sections[si].name[".nv.info.".len()..].to_string();
-        let text_idx = match e.section(&format!(".text.{}", fn_name)) {
-            Some(i) => i,
-            None => continue,
-        };
-        let sdata = e.sections[si].data.clone();
-        let mut pos = 0;
-        while pos + 4 <= sdata.len() {
-            let fmt = sdata[pos];
-            let attr = sdata[pos + 1];
-            let val = u16::from_le_bytes(sdata[pos + 2..pos + 4].try_into().unwrap()) as usize;
-            if fmt == 4 && attr == 0x0f {
-                let mut at = pos + 4;
-                while at + 4 <= (pos + 4 + val).min(sdata.len()) {
-                    let callee = u32::from_le_bytes(sdata[at..at + 4].try_into().unwrap()) as usize;
-                    if let Some(&cs) = by_symbol.get(&callee) {
-                        edges.push((text_idx, cs));
+    for (slot, sections) in info_secs.iter().enumerate() {
+        for &ii in sections {
+            let sdata = &e.sections[ii].data;
+            let mut pos = 0;
+            while pos + 4 <= sdata.len() {
+                let fmt = sdata[pos];
+                let attr = sdata[pos + 1];
+                let val = u16::from_le_bytes(sdata[pos + 2..pos + 4].try_into().unwrap()) as usize;
+                if fmt == 4 && attr == 0x0f {
+                    let mut at = pos + 4;
+                    while at + 4 <= (pos + 4 + val).min(sdata.len()) {
+                        let callee = u32::from_le_bytes(sdata[at..at + 4].try_into().unwrap()) as usize;
+                        if let Some(&cs) = by_symbol.get(&callee) {
+                            let fa = find_group(&mut group_parent, slot);
+                            let fb = find_group(&mut group_parent, cs);
+                            if fa != fb {
+                                group_parent[fa] = fb;
+                            }
+                        }
+                        at += 4;
                     }
-                    at += 4;
                 }
+                pos += if fmt == 4 { 4 + val } else { 4 };
             }
-            pos += if fmt == 4 { 4 + val } else { 4 };
-        }
-    }
-    for &(a, b) in &edges {
-        let fa = find(&mut group, a);
-        let fb = find(&mut group, b);
-        if fa != fb {
-            group.insert(fa, fb);
         }
     }
 
-    // Parse each function
+    let total_code_bytes: usize = texts.iter().map(|&si| e.sections[si].data.len()).sum();
+    let large = total_code_bytes >= PARALLEL_CODE_BYTES;
+    let parse_threads = forced_threads
+        .map(|t| t.min(n_texts.max(1)).max(1))
+        .unwrap_or_else(|| effective_threads(n_texts, large));
+
+    // Parse each function (parallelized across `VF_THREADS`, preserving warm `dec75` per worker).
+    let slot_indices: Vec<usize> = (0..n_texts).collect();
+    let parsed_slots: Vec<Result<FuncData, Refused>> = par_map_init(
+        &slot_indices,
+        parse_threads,
+        || Decoder::new(75),
+        |dec75, _, &slot| -> Result<Result<FuncData, Refused>, std::convert::Infallible> {
+            let res: Result<FuncData, Refused> = (|| {
+                let si = texts[slot];
+                let name = &e.sections[si].name[".text.".len()..];
+                let registers = e.sections[si].info >> 24;
+                let tables = match info_sec[slot] {
+                    Some(ii) => tables_of(&e.sections[ii].data)?,
+                    None => Vec::new(),
+                };
+                let code = &e.sections[si].data;
+                let mut fd = if arch != 80 {
+                    parse_function(dec75, name, code, registers, tables)?
+                } else {
+                    let mut helpers = symbols_by_text[slot].iter().copied().filter(|&index| {
+                        let s = &symbols[index];
+                        s.info & 15 == 2 && s.value != 0
+                    });
+                    let mut helper = None;
+                    if let Some(index) = helpers.next() {
+                        let s = &symbols[index];
+                        if helpers.next().is_some()
+                            || (s.info >> 4 != 0 && !vf_fatbin::cubin_has_assembler_helper(data, index))
+                            || s.other & 0x10 != 0
+                            || s.size == 0
+                            || !s.value.is_multiple_of(16)
+                            || s.value.checked_add(s.size) != Some(code.len() as u64)
+                        {
+                            return Err(Refused("unsupported secondary entry in sm_80 code".into()));
+                        }
+                        helper = Some(s.value as usize / 16);
+                    }
+                    if relocations.contains_key(&si) {
+                        return Err(Refused("a relocation in sm_80 code".into()));
+                    }
+                    let normalized = super::ampere::normalize(code, dec75, helper)?;
+                    let mut fd = parse_function(dec75, name, &normalized.words, registers, tables)?;
+                    fd.ampere_ops = normalized.operations;
+                    for (i, op) in &fd.ampere_ops {
+                        match op {
+                            super::ampere::Operation::GlobalToShared { .. } => {
+                                fd.scratch_need = fd.scratch_need.max(6);
+                            }
+                            super::ampere::Operation::IncrementShared { .. } => {
+                                fd.scratch_need = fd.scratch_need.max(2);
+                            }
+                            super::ampere::Operation::Bf16Add | super::ampere::Operation::Bf16Pack => {
+                                fd.scratch_need = fd.scratch_need.max(3);
+                            }
+                            super::ampere::Operation::Pack => {
+                                fd.needs_pool |= fd.src[*i].op_or(crate::generated::fields::OP_RC, 255) != 255;
+                            }
+                        }
+                    }
+                    fd.ampere = true;
+                    fd
+                };
+                fd.entered_inside = entered_inside[slot];
+                Ok(fd)
+            })();
+            Ok(res)
+        },
+    )
+    .expect("parsing returns Result inside Vec");
+
     let before: Vec<usize> = texts.iter().map(|&si| e.sections[si].data.len() / 16).collect();
-    let mut report: Vec<(String, Option<String>)> = Vec::new();
-    let mut functions: HashMap<usize, FuncData> = HashMap::new();
-    for &si in &texts {
-        let name = e.sections[si].name[".text.".len()..].to_string();
-        let registers = e.sections[si].info >> 24;
-        let tables = match e.section(&format!(".nv.info.{}", name)) {
-            Some(ii) => tables_of(&e.sections[ii].data),
-            None => Ok(Vec::new()),
-        };
-        let parsed = tables.and_then(|tables| {
-            let code = &e.sections[si].data;
-            if arch != 80 {
-                return parse_function(&mut dec75, &name, code, registers, tables);
-            }
-            let mut helpers = symbols
-                .iter()
-                .enumerate()
-                .filter(|(_, s)| s.shndx as usize == si && s.info & 15 == 2 && s.value != 0);
-            let mut helper = None;
-            if let Some((index, s)) = helpers.next() {
-                if helpers.next().is_some()
-                    || (s.info >> 4 != 0 && !vf_fatbin::cubin_has_assembler_helper(data, index))
-                    || s.other & 0x10 != 0
-                    || s.size == 0
-                    || !s.value.is_multiple_of(16)
-                    || s.value.checked_add(s.size) != Some(code.len() as u64)
-                {
-                    return Err(Refused("unsupported secondary entry in sm_80 code".into()));
+    let mut report_reasons: Vec<Option<String>> = vec![None; n_texts];
+    let mut functions: Vec<Option<FuncData>> = Vec::with_capacity(n_texts);
+    for (slot, res) in parsed_slots.into_iter().enumerate() {
+        let si = texts[slot];
+        match res {
+            Ok(mut fd) => {
+                if holders.contains(&si) {
+                    report_reasons[slot] = Some("a relocation in its code names a place in code".into());
+                    functions.push(None);
+                } else if named.contains(&si) {
+                    report_reasons[slot] = Some("a relocation names a place in its code".into());
+                    functions.push(None);
+                } else {
+                    let _ = &mut fd;
+                    functions.push(Some(fd));
                 }
-                helper = Some(s.value as usize / 16);
-            }
-            if relocations.contains_key(&si) {
-                return Err(Refused("a relocation in sm_80 code".into()));
-            }
-            let normalized = super::ampere::normalize(code, &mut dec75, helper)?;
-            let mut fd = parse_function(&mut dec75, &name, &normalized.words, registers, tables)?;
-            fd.ampere_ops = normalized.operations;
-            for (i, op) in &fd.ampere_ops {
-                match op {
-                    super::ampere::Operation::GlobalToShared { .. } => fd.scratch_need = fd.scratch_need.max(6),
-                    super::ampere::Operation::IncrementShared { .. } => fd.scratch_need = fd.scratch_need.max(2),
-                    super::ampere::Operation::Bf16Add | super::ampere::Operation::Bf16Pack => {
-                        fd.scratch_need = fd.scratch_need.max(3)
-                    }
-                    super::ampere::Operation::Pack => {
-                        fd.needs_pool |= fd.src[*i].op_or(crate::generated::fields::OP_RC, 255) != 255
-                    }
-                }
-            }
-            fd.ampere = true;
-            Ok(fd)
-        });
-        match parsed {
-            Ok(fd) => {
-                functions.insert(si, fd);
-                report.push((name, None));
             }
             Err(why) => {
-                report.push((name, Some(why.0)));
+                report_reasons[slot] = Some(why.0);
+                functions.push(None);
             }
         }
     }
 
-    // The sections that are kernels: a function symbol with the mark of an entry point.
-    let entries: HashSet<usize> = symbols
-        .iter()
-        .filter(|sym| sym.info & 0xf == 2 && sym.other & 0x10 != 0)
-        .map(|sym| sym.shndx as usize)
-        .collect();
-
-    // A function of its own within the section of another (the helpers that the code of the
-    // section calls are weak symbols): it is entered there, not at the start of the section.
-    for sym in &symbols {
-        if sym.info & 0xf == 2 && sym.info >> 4 == 1 && sym.value != 0 {
-            let si = sym.shndx as usize;
-            if let Some(fd) = functions.get_mut(&si) {
-                fd.entered_inside = true;
-            }
+    // Group functions by call edges, filtering out any group where a member was refused.
+    let mut root_to_group: FastMap<usize, usize> = FastMap::default();
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for slot in 0..n_texts {
+        let root = find_group(&mut group_parent, slot);
+        if let Some(&gidx) = root_to_group.get(&root) {
+            groups[gidx].push(slot);
+        } else {
+            root_to_group.insert(root, groups.len());
+            groups.push(vec![slot]);
         }
     }
 
-    // A relocation that names a place in code: the function it names and the function it is in.
-    for &si in &texts {
-        if (holders.contains(&si) || named.contains(&si))
-            && let Some(fd) = functions.remove(&si)
-        {
-            let why = if holders.contains(&si) {
-                "a relocation in its code names a place in code"
-            } else {
-                "a relocation names a place in its code"
-            };
-            set_report(&mut report, &fd.name, why);
-        }
-    }
-
-    // Group and translate
-    let mut members: HashMap<usize, Vec<usize>> = HashMap::new();
-    for &si in &texts {
-        let root = find(&mut group, si);
-        members.entry(root).or_default().push(si);
-    }
-
-    let mut results: HashMap<usize, TransResult> = HashMap::new();
-
-    for indices in members.values() {
-        if indices.iter().any(|i| !functions.contains_key(i)) {
-            for i in indices {
-                if functions.contains_key(i) {
-                    let name = e.sections[*i].name[".text.".len()..].to_string();
-                    set_report(&mut report, &name, "a function it calls, or that calls it, is refused");
+    let mut active_groups: Vec<(usize, Vec<usize>)> = Vec::new();
+    for gslots in groups {
+        if gslots.iter().any(|&slot| functions[slot].is_none()) {
+            for &slot in &gslots {
+                if functions[slot].is_some() {
+                    report_reasons[slot] = Some("a function it calls, or that calls it, is refused".into());
                 }
             }
-            continue;
-        }
-        let fs: Vec<&FuncData> = indices.iter().map(|i| &functions[i]).collect();
-
-        // Where the registers of the translation go, every function of the group, then the
-        // attributes of each: the first refusal is the group's.
-        let mut done: Vec<(usize, TransResult)> = Vec::new();
-        let mut why: Option<String> = None;
-        let declared = fs.iter().map(|f| f.registers).max().unwrap();
-        // The fewest registers that the block a kernel of the group requires allows, and that block.
-        let required = fs
-            .iter()
-            .filter_map(|f| {
-                let info = e
-                    .section(&format!(".nv.info.{}", f.name))
-                    .map_or(&[][..], |i| e.sections[i].data.as_slice());
-                let threads = super::block_registers::required_threads(info)?;
-                Some((super::block_registers::registers_for(threads), threads))
-            })
-            .min();
-        if fs.len() > 1 && fs.iter().any(|f| !f.uniform_predicates.is_empty()) {
-            why = Some("uniform predicates in functions that call one another".into());
-        } else if let Some(f) = fs.iter().find(|f| f.highest >= declared) {
-            why = Some(format!(
-                "register R{} is used and the function declares {}",
-                f.highest, declared
-            ));
         } else {
-            // The predicates of each, then the registers of the translation, which start after
-            // the last one any of them uses.
+            let cost: usize = gslots
+                .iter()
+                .map(|&slot| functions[slot].as_ref().unwrap().src.len())
+                .sum();
+            active_groups.push((cost, gslots));
+        }
+    }
+
+    // Sort longest-processing-time-first so large kernels schedule before small ones.
+    active_groups.sort_by_key(|(cost, gslots)| (Reverse(*cost), gslots[0]));
+
+    let say_borrows = std::env::var_os("VF_BORROW_SAY").is_some();
+    let group_threads = forced_threads
+        .map(|t| t.min(active_groups.len().max(1)).max(1))
+        .unwrap_or_else(|| effective_threads(active_groups.len(), large));
+
+    struct GroupOutput {
+        outcome: Result<Vec<(usize, TransResult)>, String>,
+        logs: Vec<String>,
+    }
+
+    let group_outputs: Vec<GroupOutput> = par_map_init(
+        &active_groups,
+        group_threads,
+        || Decoder::new(70),
+        |dec70, _, (_cost, gslots)| -> Result<GroupOutput, std::convert::Infallible> {
+            let fs: Vec<&FuncData> = gslots.iter().map(|&s| functions[s].as_ref().unwrap()).collect();
+            let indices: Vec<usize> = gslots.iter().map(|&s| texts[s]).collect();
+            let logs = std::cell::RefCell::new(Vec::<String>::new());
+
+            let declared = fs.iter().map(|f| f.registers).max().unwrap();
+            let required = fs
+                .iter()
+                .zip(gslots.iter())
+                .filter_map(|(_f, &slot)| {
+                    let info = info_sec[slot].map_or(&[][..], |ii| e.sections[ii].data.as_slice());
+                    let threads = super::block_registers::required_threads(info)?;
+                    Some((super::block_registers::registers_for(threads), threads))
+                })
+                .min();
+
+            if fs.len() > 1 && fs.iter().any(|f| !f.uniform_predicates.is_empty()) {
+                return Ok(GroupOutput {
+                    outcome: Err("uniform predicates in functions that call one another".into()),
+                    logs: logs.into_inner(),
+                });
+            }
+            if let Some(f) = fs.iter().find(|f| f.highest >= declared) {
+                return Ok(GroupOutput {
+                    outcome: Err(format!("register R{} is used and the function declares {}", f.highest, declared)),
+                    logs: logs.into_inner(),
+                });
+            }
+
             let predicates: Result<Vec<Predicates>, Refused> = fs.iter().map(|f| stand_ins(f)).collect();
             let attempt_result = predicates.and_then(|predicates| {
                 let saves = predicates.iter().map(|p| p.save_slots).max().unwrap_or(0);
-                // A function's pairing plan depends on the original instructions and control
-                // flow. Register-placement retries and budget alternatives can reuse it.
+                // Lazily compute Flow once per function (shared between pairing and Borrowed).
+                let flow_cells: Vec<std::cell::OnceCell<crate::pairing::Flow>> =
+                    (0..fs.len()).map(|_| std::cell::OnceCell::new()).collect();
+                let flow_of = |k: usize| -> &crate::pairing::Flow {
+                    flow_cells[k].get_or_init(|| {
+                        let f = fs[k];
+                        let ent = entries(f);
+                        crate::pairing::Flow::new_with_facts(
+                            &f.src,
+                            &f.tables,
+                            &ent,
+                            opts.pairs && f.needs_lane && !f.entered_inside,
+                        )
+                    })
+                };
+
                 let paired = std::cell::LazyCell::new(|| {
                     fs.iter()
-                        .map(|f| {
+                        .enumerate()
+                        .map(|(k, f)| {
                             if opts.pairs && f.needs_lane && !f.entered_inside {
-                                crate::pairing::plan(&f.src, &f.tables, &self::entries(f))
+                                crate::pairing::plan_with_flow(&f.src, flow_of(k))
                             } else {
                                 None
                             }
                         })
                         .collect::<Vec<_>>()
                 });
-                let unpaired: Vec<_> = fs.iter().map(|_| None).collect();
-                // `borrow_level`: 2, the uniform registers that find a home in the function's
-                // own registers have it and the pool is taken there at each instruction; 1, the
-                // homes only, the pool above; 0, everything above, as it was.
-                let mut attempt = |do_pairs: bool, borrow_level: u32, top_override: Option<u32>, gave_up: &[String]| -> Result<Vec<(usize, TransResult)>, Refused> {
+                let unpaired: Vec<Option<crate::pairing::Plan>> = fs.iter().map(|_| None).collect();
+
+                // Cache BorrowedPrepared across borrow levels (1, 2, 3) for single-function groups.
+                let borrowed_prep_cell: std::cell::OnceCell<Result<BorrowedPrepared, Refused>> =
+                    std::cell::OnceCell::new();
+                let get_borrowed_prep = || -> Result<&BorrowedPrepared, Refused> {
+                    match borrowed_prep_cell.get_or_init(|| BorrowedPrepared::new(fs[0], flow_of(0))) {
+                        Ok(p) => Ok(p),
+                        Err(e) => Err(Refused(e.0.clone())),
+                    }
+                };
+
+                let mut attempt = |do_pairs: bool,
+                                   borrow_level: u32,
+                                   top_override: Option<u32>,
+                                   gave_up: &[String]|
+                 -> Result<Vec<(usize, TransResult)>, Refused> {
                     let plans = if do_pairs { &*paired } else { &unpaired };
-                    // has_product when not in a pair site.
                     let has_product_flags: Vec<bool> = fs
                         .iter()
                         .zip(plans.iter())
                         .map(|(f, q)| {
-                            let sites: std::collections::BTreeSet<usize> = q
-                                .as_ref()
-                                .map_or_else(Default::default, |p| p.sites.keys().copied().collect());
-                            f.src
-                                .iter()
-                                .enumerate()
-                                .any(|(i, d)| d.name == "hmma_x8_" && !sites.contains(&i))
+                            q.as_ref().map_or_else(
+                                || f.src.iter().any(|d| d.name == "hmma_x8_"),
+                                |p| {
+                                    f.src
+                                        .iter()
+                                        .enumerate()
+                                        .any(|(i, d)| d.name == "hmma_x8_" && !p.sites.contains_key(&i))
+                                },
+                            )
                         })
                         .collect();
-                    // The rows and their sharing.
                     let mut rows: std::collections::BTreeMap<u32, u32> = std::collections::BTreeMap::new();
                     let mut shares: HashMap<u32, u32> = HashMap::new();
                     for plan in plans.iter().flatten() {
@@ -353,11 +455,7 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                     let row_kept: Vec<&'static str> = crate::pairing::ROW_KEPT
                         .iter()
                         .copied()
-                        .filter(|&name| {
-                            plans
-                                .iter()
-                                .any(|q| q.as_ref().is_some_and(|p| p.kept().contains(name)))
-                        })
+                        .filter(|&name| plans.iter().any(|q| q.as_ref().is_some_and(|p| p.kept().contains(name))))
                         .collect();
                     let held_preds = {
                         let mut s: Vec<u32> = predicates
@@ -366,23 +464,16 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                             .collect::<HashSet<_>>()
                             .into_iter()
                             .collect();
-                        s.sort();
+                        s.sort_unstable();
                         s
                     };
-                    // When borrowing: compute Borrowed for the single kernel.
                     let mut borrowed = if borrow_level > 0 {
                         let all_in_memory = borrow_level == 3 && (opts.borrow == 3 || opts.borrow == 8);
-                        Some(Borrowed::new(fs[0], all_in_memory, top_override)?)
+                        Some(get_borrowed_prep()?.instantiate(fs[0], all_in_memory, top_override))
                     } else {
                         None
                     };
                     if borrow_level == 3 {
-                        // Level 3: everything at the instruction. Unhomed uniform registers in
-                        // local memory; pool, scratch, lane taken at each instruction.
-                        // At VF_BORROW >= 7 a function with a matrix product is translated at
-                        // level 3: the lane is read at each product, the four values computed
-                        // there, B gathered every time, and every register taken at the instruction
-                        // (`docs/translator.md`, "Registers"). At VF_BORROW < 7: refused as before.
                         let f = &fs[0];
                         if f.product_count > 0 && opts.borrow < 7 {
                             return Err(Refused("a matrix product in a function at level 3".into()));
@@ -391,15 +482,12 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                         b.everything = true;
                         let pairs_set: HashSet<u32> = f.pairs.iter().copied().collect();
                         let mut sorted_uniform = f.uniform.clone();
-                        sorted_uniform.sort();
+                        sorted_uniform.sort_unstable();
                         b.assign_slots(&sorted_uniform, &pairs_set);
-                        // VF_BORROW >= 5: room is made where there is none, and the frame
-                        // is addressed from the stack pointer; in a function that never moves it.
                         if opts.borrow >= 5 && b.r1_fixed {
                             b.room = true;
                             b.from_r1 = true;
                         }
-                        // A uniform predicate held in a register: one register free through all its lives.
                         let mut spans_by_q: std::collections::BTreeMap<u32, std::collections::BTreeSet<usize>> =
                             std::collections::BTreeMap::new();
                         for &(q, ref part) in &predicates[0].held_lives {
@@ -415,10 +503,11 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                                 b.predicate_slots.insert(q, slot);
                                 b.frame_bytes = (4 * b.slot_count()).next_multiple_of(16);
                             } else {
-                                return Err(Refused(format!("no register holds nothing through the lives of uniform predicate UP{q}")));
+                                return Err(Refused(format!(
+                                    "no register holds nothing through the lives of uniform predicate UP{q}"
+                                )));
                             }
                         }
-                        // Above the registers that may be taken: saved predicates only.
                         let placed = placement(
                             b.top + 1,
                             &[],
@@ -432,50 +521,61 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                             &[],
                             &[],
                         )?;
+                        let slot = gslots[0];
                         let si = indices[0];
                         let place_map: HashMap<u32, u32> = b.homes.clone();
                         match translate_function(
-                            &mut dec70,
-                            &functions[&si],
+                            dec70,
+                            fs[0],
                             &predicates[0],
                             &place_map,
                             None,
-                            placed.2, // save
-                            None,     // no lane (taken at instruction)
-                            None,     // no kept
-                            None,     // no gathered
-                            None,     // no scratch (taken at instruction)
-                            placed.7, // free
-                            None,     // no pairs plan
+                            placed.2,
+                            None,
+                            None,
+                            None,
+                            None,
+                            placed.7,
+                            None,
                             HashMap::new(),
                             HashMap::new(),
                             opts.aligned_rows,
-                            false, // no has_product_non_pair
+                            false,
                             &held_at,
                             borrowed.as_mut(),
                         ) {
                             Ok(tr) => {
-                                if std::env::var("VF_BORROW_SAY").is_ok() {
-                                    let f = &fs[0];
+                                if say_borrows {
                                     let b = borrowed.as_ref().unwrap();
-                                    let gu = if gave_up.is_empty() { "-".to_string() } else { gave_up.join("; ") };
-                                    eprintln!(
+                                    let gu = if gave_up.is_empty() {
+                                        "-".to_string()
+                                    } else {
+                                        gave_up.join("; ")
+                                    };
+                                    logs.borrow_mut().push(format!(
                                         "  registers\t{}\t{}\t{}\tlevel 3\tuniform {}\thomed {}\tin memory {}\tframe {}\tsaves {}\theld {}\tproducts {}\tgave up: {}",
-                                        f.name, f.registers, tr.count,
-                                        f.uniform.len(), b.homes.len(),
-                                        b.slots.len(), b.frame_bytes,
-                                        predicates[0].save_slots, held_at.len(),
-                                        f.product_count, gu
-                                    );
+                                        f.name,
+                                        f.registers,
+                                        tr.count,
+                                        f.uniform.len(),
+                                        b.homes.len(),
+                                        b.slots.len(),
+                                        b.frame_bytes,
+                                        predicates[0].save_slots,
+                                        held_at.len(),
+                                        f.product_count,
+                                        gu
+                                    ));
                                 }
+                                let _ = slot;
                                 return Ok(vec![(si, tr)]);
                             }
                             Err(refused) => return Err(refused),
                         }
                     }
+
                     let homes: HashMap<u32, u32> = borrowed.as_ref().map_or_else(HashMap::new, |b| b.homes.clone());
                     let homed_set: HashSet<u32> = homes.keys().copied().collect();
-                    // Uniform registers not homed: those that still need placement above.
                     let uniform_for_placement: Vec<u32> = {
                         let mut all: Vec<u32> = fs.iter().flat_map(|f| f.uniform.iter().copied()).collect();
                         all.sort_unstable();
@@ -514,12 +614,10 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                         kept_rows_base,
                         hold_at,
                     ) = placed;
-                    // Merge the borrowed homes into the placement map.
                     for (&u, &r) in &homes {
                         place.insert(u, r);
                     }
-                    // Apply sharing: each destination gets the rows_at of the destination it shares with.
-                    let mut result = Vec::new();
+                    let mut result = Vec::with_capacity(fs.len());
                     for (k, (&si, predicates)) in indices.iter().zip(&predicates).enumerate() {
                         let plan = &plans[k];
                         let mut func_rows_at = HashMap::new();
@@ -531,9 +629,9 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                                 }
                             }
                         }
-                        match translate_function(
-                            &mut dec70,
-                            &functions[&si],
+                        let tr = translate_function(
+                            dec70,
+                            fs[k],
                             predicates,
                             &place,
                             pool,
@@ -550,33 +648,42 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                             has_product_flags[k],
                             &hold_at,
                             borrowed.as_mut(),
-                        ) {
-                            Ok(tr) => result.push((si, tr)),
-                            Err(refused) => return Err(refused),
-                        }
+                        )?;
+                        result.push((si, tr));
                     }
-                    if std::env::var("VF_BORROW_SAY").is_ok() && fs.len() == 1 {
+                    if say_borrows && fs.len() == 1 {
                         let f = &fs[0];
                         let count = result.iter().map(|(_, tr)| tr.count).max().unwrap_or(0);
                         let n_homes = borrowed.as_ref().map_or(0, |b| b.homes.len());
                         let pool_count = if f.needs_pool && borrow_level != 2 { 2 } else { 0 };
-                        let gu = if gave_up.is_empty() { "-".to_string() } else { gave_up.join("; ") };
-                        eprintln!(
+                        let gu = if gave_up.is_empty() {
+                            "-".to_string()
+                        } else {
+                            gave_up.join("; ")
+                        };
+                        logs.borrow_mut().push(format!(
                             "  registers\t{}\t{}\t{}\tlevel {}\tuniform {}\thomed {}\tpool {}\tsaves {}\theld {}\tproducts {}\tgave up: {}",
-                            f.name, f.registers, count, borrow_level,
-                            f.uniform.len(), n_homes, pool_count,
-                            saves, held_preds.len(), f.product_count,
+                            f.name,
+                            f.registers,
+                            count,
+                            borrow_level,
+                            f.uniform.len(),
+                            n_homes,
+                            pool_count,
+                            saves,
+                            held_preds.len(),
+                            f.product_count,
                             gu
-                        );
+                        ));
                     }
                     Ok(result)
                 };
-                let alone = fs.len() == 1 && indices.iter().any(|si| entries.contains(si));
+
+                let alone = fs.len() == 1 && indices.iter().any(|si| entry_secs.contains(si));
                 let has_pairs_to_drop = || paired.iter().any(Option::is_some);
                 type Tried = Result<Vec<(usize, TransResult)>, Refused>;
                 type AttemptFn<'a> = dyn FnMut(bool, u32, Option<u32>, &[String]) -> Tried + 'a;
                 let empty_gave_up: Vec<String> = Vec::new();
-                // usual(): the chain of attempts (levels 2, 1, 0, pairs fallback).
                 let usual = |attempt: &mut AttemptFn<'_>| {
                     let r = if opts.borrow > 0 && alone {
                         attempt(true, 2, None, &[])
@@ -593,7 +700,6 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                         }
                     })
                 };
-                // plain(): level 0 with pairs fallback but no borrow (for the budget).
                 let plain = |attempt: &mut AttemptFn<'_>, gave_up: &[String]| {
                     attempt(true, 0, None, gave_up).or_else(|refused| {
                         if has_pairs_to_drop() {
@@ -603,276 +709,282 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                         }
                     })
                 };
-                let chosen: Tried = 'chain: { if opts.borrow == 8 && alone {
-                    // For tests: level 3 first for EVERY kernel, products included (as 3 is
-                    // without products). With room made: a small function that has not enough
-                    // registers for the product's scratch at once gets them above its own (top
-                    // extended by 16 for the product, as it would at level 0). Falls back to
-                    // the usual chain when level 3 is refused.
-                    let f = &fs[0];
-                    let extra: u32 = if f.product_count > 0 { 16 } else { 0 };
-                    let top_for_8 = if extra > 0 { Some(f.highest + extra) } else { None };
-                    match attempt(false, 3, top_for_8, &empty_gave_up) {
-                        Ok(d) => Ok(d),
-                        Err(ref e) => {
-                            eprintln!("level 3 failed for {}: {}", fs[0].name, e.0);
-                            usual(&mut attempt)
-                        }
-                    }
-                } else if matches!(opts.borrow, 7 | 9) && alone {
-                    // What 6 does, and a function with products may be translated at level 3.
-                    // The chain: plain; levels 1, 2; level 3 with room and with products.
-                    let mut gave_up: Vec<String> = Vec::new();
-                    let plain_result = plain(&mut attempt, &gave_up);
-                    let normal = match plain_result {
-                        Ok(d) => Ok(d),
-                        Err(original_why) if original_why.0 == "more registers than there are" => {
-                            gave_up.push(original_why.0.clone());
-                            let original_msg = original_why.0.clone();
-                            // Try levels 1, 2, 3 in order.
-                            let mut done = None;
-                            for (do_p, bl) in [(true, 1u32), (true, 2), (false, 3)] {
-                                match attempt(do_p, bl, None, &gave_up) {
-                                    Ok(d) => { done = Some(d); break; }
-                                    Err(e) => { gave_up.push(e.0); }
-                                }
+
+                let chosen: Tried = 'chain: {
+                    if opts.borrow == 8 && alone {
+                        let f = &fs[0];
+                        let extra: u32 = if f.product_count > 0 { 16 } else { 0 };
+                        let top_for_8 = if extra > 0 { Some(f.highest + extra) } else { None };
+                        match attempt(false, 3, top_for_8, &empty_gave_up) {
+                            Ok(d) => Ok(d),
+                            Err(ref err) => {
+                                logs.borrow_mut().push(format!("level 3 failed for {}: {}", fs[0].name, err.0));
+                                usual(&mut attempt)
                             }
-                            match done {
-                                Some(d) => Ok(d),
-                                None => {
-                                    if std::env::var("VF_BORROW_SAY").is_ok() {
-                                        eprintln!(
-                                            "  refused\t{}\t{}\tand with borrowed registers: {}",
-                                            fs[0].name, original_msg,
-                                            gave_up[1..].join("; ")
-                                        );
+                        }
+                    } else if matches!(opts.borrow, 7 | 9) && alone {
+                        let mut gave_up: Vec<String> = Vec::new();
+                        let plain_result = plain(&mut attempt, &gave_up);
+                        let normal = match plain_result {
+                            Ok(d) => Ok(d),
+                            Err(original_why) if original_why.0 == "more registers than there are" => {
+                                gave_up.push(original_why.0.clone());
+                                let original_msg = original_why.0.clone();
+                                let mut done = None;
+                                for (do_p, bl) in [(true, 1u32), (true, 2), (false, 3)] {
+                                    match attempt(do_p, bl, None, &gave_up) {
+                                        Ok(d) => {
+                                            done = Some(d);
+                                            break;
+                                        }
+                                        Err(err) => {
+                                            gave_up.push(err.0);
+                                        }
                                     }
-                                    Err(Refused(original_msg))
                                 }
-                            }
-                        }
-                        Err(e) => Err(e),
-                    }?;
-                    if opts.borrow == 9 {
-                        let f = fs[0];
-                        let info = e.section(&format!(".nv.info.{}", f.name))
-                            .map_or(&[][..], |i| e.sections[i].data.as_slice());
-                        let limit = super::block_registers::budget(f.registers, info);
-                        // Relocations and jump tables are checked after placement. Keep the working
-                        // layout when a second placement could change how those sites are rewritten.
-                        if normal[0].1.count > limit && !relocations.contains_key(&indices[0]) && f.tables.is_empty() {
-                            let top = limit.saturating_sub(3).saturating_sub(saves);
-                            for (pairs, level, bound) in [(true, 1, None), (true, 2, None), (false, 3, Some(top))] {
-                                if let Ok(candidate) = attempt(pairs, level, bound, &gave_up)
-                                    && candidate[0].1.count <= limit
-                                {
-                                    // Attributes and symbols may point at any original instruction. Preserve
-                                    // every address that the ordinary translation could carry over.
-                                    let old = &normal[0].1.new_of;
-                                    let new = &candidate[0].1.new_of;
-                                    if old.len() == new.len() && old.keys().all(|offset| new.contains_key(offset)) {
-                                        break 'chain Ok(candidate);
+                                match done {
+                                    Some(d) => Ok(d),
+                                    None => {
+                                        if say_borrows {
+                                            logs.borrow_mut().push(format!(
+                                                "  refused\t{}\t{}\tand with borrowed registers: {}",
+                                                fs[0].name,
+                                                original_msg,
+                                                gave_up[1..].join("; ")
+                                            ));
+                                        }
+                                        Err(Refused(original_msg))
                                     }
-                                    break;
+                                }
+                            }
+                            Err(err) => Err(err),
+                        }?;
+                        if opts.borrow == 9 {
+                            let f = fs[0];
+                            let info = info_sec[gslots[0]].map_or(&[][..], |ii| e.sections[ii].data.as_slice());
+                            let limit = super::block_registers::budget(f.registers, info);
+                            if normal[0].1.count > limit && !relocations.contains_key(&indices[0]) && f.tables.is_empty() {
+                                let top = limit.saturating_sub(3).saturating_sub(saves);
+                                for (pairs, level, bound) in [(true, 1, None), (true, 2, None), (false, 3, Some(top))] {
+                                    if let Ok(candidate) = attempt(pairs, level, bound, &gave_up)
+                                        && candidate[0].1.count <= limit
+                                    {
+                                        let old = &normal[0].1.new_of;
+                                        let new = &candidate[0].1.new_of;
+                                        if old.len() == new.len() && old.keys().all(|offset| new.contains_key(offset)) {
+                                            break 'chain Ok(candidate);
+                                        }
+                                        break;
+                                    }
                                 }
                             }
                         }
-                    }
-                    Ok(normal)
-                } else if opts.borrow == 6 && alone {
-                    // What the layer does by itself. Wherever the translation of the
-                    // switch off exists it is the one taken, byte for byte. A kernel that is
-                    // refused for want of registers gets, in this order: homes (level 1),
-                    // the pool at the instruction too (level 2), then everything at the
-                    // instruction, with room made where there is none (level 3). And when
-                    // none translates, it is refused for the reason it was refused before.
-                    let mut gave_up: Vec<String> = Vec::new();
-                    let plain_result = plain(&mut attempt, &gave_up);
-                    match plain_result {
-                        Ok(d) => Ok(d),
-                        Err(original_why) if original_why.0 == "more registers than there are" => {
-                            gave_up.push(original_why.0.clone());
-                            let original_msg = original_why.0.clone();
-                            // Try levels 1, 2, 3 in order.
-                            match attempt(true, 1, None, &gave_up) {
-                                Ok(d) => Ok(d),
-                                Err(e1) => {
-                                    gave_up.push(e1.0);
-                                    match attempt(true, 2, None, &gave_up) {
-                                        Ok(d) => Ok(d),
-                                        Err(e2) => {
-                                            gave_up.push(e2.0);
-                                            match attempt(false, 3, None, &gave_up) {
-                                                Ok(d) => Ok(d),
-                                                Err(e3) => {
-                                                    gave_up.push(e3.0);
-                                                    if std::env::var("VF_BORROW_SAY").is_ok() {
-                                                        eprintln!(
-                                                            "  refused\t{}\t{}\tand with borrowed registers: {}",
-                                                            fs[0].name, original_msg,
-                                                            gave_up[1..].join("; ")
-                                                        );
+                        Ok(normal)
+                    } else if opts.borrow == 6 && alone {
+                        let mut gave_up: Vec<String> = Vec::new();
+                        let plain_result = plain(&mut attempt, &gave_up);
+                        match plain_result {
+                            Ok(d) => Ok(d),
+                            Err(original_why) if original_why.0 == "more registers than there are" => {
+                                gave_up.push(original_why.0.clone());
+                                let original_msg = original_why.0.clone();
+                                match attempt(true, 1, None, &gave_up) {
+                                    Ok(d) => Ok(d),
+                                    Err(e1) => {
+                                        gave_up.push(e1.0);
+                                        match attempt(true, 2, None, &gave_up) {
+                                            Ok(d) => Ok(d),
+                                            Err(e2) => {
+                                                gave_up.push(e2.0);
+                                                match attempt(false, 3, None, &gave_up) {
+                                                    Ok(d) => Ok(d),
+                                                    Err(e3) => {
+                                                        gave_up.push(e3.0);
+                                                        if say_borrows {
+                                                            logs.borrow_mut().push(format!(
+                                                                "  refused\t{}\t{}\tand with borrowed registers: {}",
+                                                                fs[0].name,
+                                                                original_msg,
+                                                                gave_up[1..].join("; ")
+                                                            ));
+                                                        }
+                                                        Err(Refused(original_msg))
                                                     }
-                                                    Err(Refused(original_msg))
                                                 }
                                             }
                                         }
                                     }
                                 }
                             }
+                            Err(err) => Err(err),
                         }
-                        Err(e) => Err(e),
-                    }
-                } else if opts.borrow >= 4 && alone {
-                    // By the budget: a V100 gives a thread its registers by eights, and has
-                    // 65,536 of them a multiprocessor for at most 2,048 threads: a kernel
-                    // loses no thread as long as its count stays in the eight it was in, or
-                    // under 32. The levels in the order of the speed of what they make
-                    // (0: everything above, nothing to wait for; 1: homes; 2: and the pool
-                    // at the instruction; 3: everything at the instruction, with the
-                    // registers left under the budget, and memory): the first that stays
-                    // within the budget, or else the one that takes the fewest.
-                    let f = &fs[0];
-                    let budget = (f.registers.div_ceil(8) * 8).clamp(32, 255);
-                    let top_for_l3 = Some(budget.saturating_sub(3).saturating_sub(saves));
-                    // Try each level in order: 0 (plain), 1, 2, 3.
-                    struct Best {
-                        count: u32,
-                        level: u32,
-                        result: Vec<(usize, TransResult)>,
-                        within: bool,
-                    }
-                    let mut best: Option<Best> = None;
-                    let mut first_why: Option<Refused> = None;
-                    let mut gave_up: Vec<String> = Vec::new();
-                    // Level 0: plain.
-                    match plain(&mut attempt, &gave_up) {
-                        Ok(d) => {
-                            let count = d.iter().map(|(_, tr)| tr.count).max().unwrap_or(0);
-                            if count <= budget {
-                                best = Some(Best { count, level: 0, result: d, within: true });
-                            } else {
-                                best = Some(Best { count, level: 0, result: d, within: false });
-                            }
+                    } else if opts.borrow >= 4 && alone {
+                        let f = &fs[0];
+                        let budget = (f.registers.div_ceil(8) * 8).clamp(32, 255);
+                        let top_for_l3 = Some(budget.saturating_sub(3).saturating_sub(saves));
+                        struct Best {
+                            count: u32,
+                            level: u32,
+                            result: Vec<(usize, TransResult)>,
+                            within: bool,
                         }
-                        Err(refused) => {
-                            gave_up.push(refused.0.clone());
-                            first_why = Some(refused);
-                        }
-                    }
-                    if !best.as_ref().is_some_and(|b| b.within) {
-                        // Level 1.
-                        match attempt(true, 1, None, &gave_up) {
+                        let mut best: Option<Best> = None;
+                        let mut first_why: Option<Refused> = None;
+                        let mut gave_up: Vec<String> = Vec::new();
+                        match plain(&mut attempt, &gave_up) {
                             Ok(d) => {
                                 let count = d.iter().map(|(_, tr)| tr.count).max().unwrap_or(0);
-                                if count <= budget {
-                                    best = Some(Best { count, level: 1, result: d, within: true });
-                                } else if best.is_none() || count < best.as_ref().unwrap().count {
-                                    best = Some(Best { count, level: 1, result: d, within: false });
-                                }
+                                best = Some(Best {
+                                    count,
+                                    level: 0,
+                                    result: d,
+                                    within: count <= budget,
+                                });
                             }
                             Err(refused) => {
                                 gave_up.push(refused.0.clone());
-                                if first_why.is_none() { first_why = Some(refused); }
+                                first_why = Some(refused);
                             }
                         }
-                    }
-                    if !best.as_ref().is_some_and(|b| b.within) {
-                        // Level 2.
-                        match attempt(true, 2, None, &gave_up) {
-                            Ok(d) => {
-                                let count = d.iter().map(|(_, tr)| tr.count).max().unwrap_or(0);
-                                if count <= budget {
-                                    best = Some(Best { count, level: 2, result: d, within: true });
-                                } else if best.is_none() || count < best.as_ref().unwrap().count {
-                                    best = Some(Best { count, level: 2, result: d, within: false });
+                        if !best.as_ref().is_some_and(|b| b.within) {
+                            match attempt(true, 1, None, &gave_up) {
+                                Ok(d) => {
+                                    let count = d.iter().map(|(_, tr)| tr.count).max().unwrap_or(0);
+                                    if count <= budget {
+                                        best = Some(Best {
+                                            count,
+                                            level: 1,
+                                            result: d,
+                                            within: true,
+                                        });
+                                    } else if best.is_none() || count < best.as_ref().unwrap().count {
+                                        best = Some(Best {
+                                            count,
+                                            level: 1,
+                                            result: d,
+                                            within: false,
+                                        });
+                                    }
+                                }
+                                Err(refused) => {
+                                    gave_up.push(refused.0.clone());
+                                    if first_why.is_none() {
+                                        first_why = Some(refused);
+                                    }
                                 }
                             }
-                            Err(refused) => {
-                                gave_up.push(refused.0.clone());
-                                if first_why.is_none() { first_why = Some(refused); }
-                            }
                         }
-                    }
-                    if !best.as_ref().is_some_and(|b| b.within) {
-                        // Level 3.
-                        match attempt(false, 3, top_for_l3, &gave_up) {
-                            Ok(d) => {
-                                let count = d.iter().map(|(_, tr)| tr.count).max().unwrap_or(0);
-                                if count <= budget {
-                                    best = Some(Best { count, level: 3, result: d, within: true });
-                                } else if best.is_none() || count < best.as_ref().unwrap().count {
-                                    best = Some(Best { count, level: 3, result: d, within: false });
+                        if !best.as_ref().is_some_and(|b| b.within) {
+                            match attempt(true, 2, None, &gave_up) {
+                                Ok(d) => {
+                                    let count = d.iter().map(|(_, tr)| tr.count).max().unwrap_or(0);
+                                    if count <= budget {
+                                        best = Some(Best {
+                                            count,
+                                            level: 2,
+                                            result: d,
+                                            within: true,
+                                        });
+                                    } else if best.is_none() || count < best.as_ref().unwrap().count {
+                                        best = Some(Best {
+                                            count,
+                                            level: 2,
+                                            result: d,
+                                            within: false,
+                                        });
+                                    }
+                                }
+                                Err(refused) => {
+                                    gave_up.push(refused.0.clone());
+                                    if first_why.is_none() {
+                                        first_why = Some(refused);
+                                    }
                                 }
                             }
-                            Err(refused) => {
-                                gave_up.push(refused.0.clone());
-                                if first_why.is_none() { first_why = Some(refused); }
+                        }
+                        if !best.as_ref().is_some_and(|b| b.within) {
+                            match attempt(false, 3, top_for_l3, &gave_up) {
+                                Ok(d) => {
+                                    let count = d.iter().map(|(_, tr)| tr.count).max().unwrap_or(0);
+                                    if count <= budget {
+                                        best = Some(Best {
+                                            count,
+                                            level: 3,
+                                            result: d,
+                                            within: true,
+                                        });
+                                    } else if best.is_none() || count < best.as_ref().unwrap().count {
+                                        best = Some(Best {
+                                            count,
+                                            level: 3,
+                                            result: d,
+                                            within: false,
+                                        });
+                                    }
+                                }
+                                Err(refused) => {
+                                    gave_up.push(refused.0.clone());
+                                    if first_why.is_none() {
+                                        first_why = Some(refused);
+                                    }
+                                }
                             }
                         }
-                    }
-                    match best {
-                        None => Err(first_why.unwrap()),
-                        Some(mut b) => {
-                            if !b.within {
-                                // Run the best level again (the function is left as its last
-                                // attempt made it).
-                                b.result = match b.level {
-                                    0 => plain(&mut attempt, &gave_up)?,
-                                    1 => attempt(true, 1, None, &gave_up)?,
-                                    2 => attempt(true, 2, None, &gave_up)?,
-                                    3 => attempt(false, 3, top_for_l3, &gave_up)?,
-                                    _ => unreachable!(),
-                                };
+                        match best {
+                            None => Err(first_why.unwrap()),
+                            Some(mut b) => {
+                                if !b.within && say_borrows {
+                                    b.result = match b.level {
+                                        0 => plain(&mut attempt, &gave_up)?,
+                                        1 => attempt(true, 1, None, &gave_up)?,
+                                        2 => attempt(true, 2, None, &gave_up)?,
+                                        3 => attempt(false, 3, top_for_l3, &gave_up)?,
+                                        _ => unreachable!(),
+                                    };
+                                }
+                                if say_borrows {
+                                    logs.borrow_mut().push(format!(
+                                        "  budget\t{}\t{}\t{}\t{}\tlevel {}\t{}",
+                                        f.name,
+                                        f.registers,
+                                        b.count,
+                                        budget,
+                                        b.level,
+                                        if b.within { "within" } else { "over" }
+                                    ));
+                                }
+                                Ok(b.result)
                             }
-                            if std::env::var("VF_BORROW_SAY").is_ok() {
-                                eprintln!(
-                                    "  budget\t{}\t{}\t{}\t{}\tlevel {}\t{}",
-                                    f.name, f.registers, b.count, budget, b.level,
-                                    if b.within { "within" } else { "over" }
-                                );
-                            }
-                            Ok(b.result)
                         }
-                    }
-                } else if opts.borrow >= 3 && alone {
-                    // For tests: everything at the instruction first, every uniform register
-                    // in memory.
-                    match attempt(false, 3, None, &empty_gave_up) {
-                        Ok(d) => Ok(d),
-                        Err(ref e) => {
-                            eprintln!("level 3 failed for {}: {}", fs[0].name, e.0);
-                            usual(&mut attempt)
-                        }
-                    }
-                } else if opts.borrow >= 2 && alone {
-                    // Everything at the instruction for a kernel that is refused otherwise;
-                    // and when that is refused too, for the reason it was refused before.
-                    match usual(&mut attempt) {
-                        Ok(d) => Ok(d),
-                        Err(original_why) => match attempt(false, 3, None, &empty_gave_up) {
+                    } else if opts.borrow >= 3 && alone {
+                        match attempt(false, 3, None, &empty_gave_up) {
                             Ok(d) => Ok(d),
-                            Err(also) => {
-                                if std::env::var("VF_BORROW_SAY").is_ok() {
-                                    eprintln!(
-                                        "  refused\t{}\t{}\tat level 3: {}",
-                                        fs[0].name, original_why.0, also.0
-                                    );
-                                }
-                                Err(original_why)
+                            Err(ref err) => {
+                                logs.borrow_mut().push(format!("level 3 failed for {}: {}", fs[0].name, err.0));
+                                usual(&mut attempt)
                             }
-                        },
+                        }
+                    } else if opts.borrow >= 2 && alone {
+                        match usual(&mut attempt) {
+                            Ok(d) => Ok(d),
+                            Err(original_why) => match attempt(false, 3, None, &empty_gave_up) {
+                                Ok(d) => Ok(d),
+                                Err(also) => {
+                                    if say_borrows {
+                                        logs.borrow_mut().push(format!(
+                                            "  refused\t{}\t{}\tat level 3: {}",
+                                            fs[0].name, original_why.0, also.0
+                                        ));
+                                    }
+                                    Err(original_why)
+                                }
+                            },
+                        }
+                    } else {
+                        usual(&mut attempt)
                     }
-                } else {
-                    usual(&mut attempt)
-                } };
-                // A kernel that requires its block size (`block_registers::required_threads`) is
-                // launched with that block and no other: a translation with more registers than
-                // such a block may have on a V100 never runs, and a program that reads the limit
-                // from the loaded kernel (Triton) stops before any launch, so that the second
-                // translation at launch never comes. The first of levels 1, 2 and 3 that keeps
-                // within it is taken instead; when none does, the kernel is refused for its
-                // registers, and the layer runs the PTX that the cubin keeps, when it keeps some.
+                };
+
                 let Some((limit, threads)) = required else {
                     return chosen;
                 };
@@ -895,46 +1007,53 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                     "more registers than its required block of {threads} threads allows ({limit})"
                 )))
             });
-            match attempt_result {
-                Ok(d) => done = d,
-                Err(refused) => why = Some(refused.0),
-            }
-        }
-        if why.is_none() {
-            // No kernel of the file calls them: their callers are elsewhere (a library of
-            // functions, linked later) and may keep something in the registers above those these
-            // functions declare, which is where the translation would write.
+
+            let mut done = match attempt_result {
+                Ok(d) => d,
+                Err(refused) => {
+                    return Ok(GroupOutput {
+                        outcome: Err(refused.0),
+                        logs: logs.into_inner(),
+                    });
+                }
+            };
+
             let count = done.iter().map(|(_, tr)| tr.count).max().unwrap_or(0);
-            if count > declared && !indices.iter().any(|si| entries.contains(si)) {
-                why = Some(
-                    "called from code that is not in the file, and the translation needs registers above its own"
-                        .into(),
-                );
+            if count > declared && !indices.iter().any(|si| entry_secs.contains(si)) {
+                return Ok(GroupOutput {
+                    outcome: Err(
+                        "called from code that is not in the file, and the translation needs registers above its own"
+                            .into(),
+                    ),
+                    logs: logs.into_inner(),
+                });
             }
-        }
-        if why.is_none() {
-            for (si, tr) in &mut done {
+
+            for (idx, (si, tr)) in done.iter_mut().enumerate() {
                 if let Some(list) = relocations.get(si) {
-                    match follow(&functions[si], tr, list) {
+                    match follow(fs[idx], tr, list) {
                         Ok(moved) => tr.moved = moved,
                         Err(refused) => {
-                            why = Some(refused.0);
-                            break;
+                            return Ok(GroupOutput {
+                                outcome: Err(refused.0),
+                                logs: logs.into_inner(),
+                            });
                         }
                     }
                 }
             }
-        }
-        if why.is_none() {
-            for (si, tr) in &done {
-                let info_name = format!(".nv.info.{}", functions[si].name);
-                if let Some(ii) = e.section(&info_name)
+
+            for (idx, (si, tr)) in done.iter().enumerate() {
+                let slot = gslots[idx];
+                if let Some(ii) = info_sec[slot]
                     && let Err(refused) = check_attributes(&e.sections[ii].data, &tr.new_of)
                 {
-                    why = Some(refused.0);
-                    break;
+                    return Ok(GroupOutput {
+                        outcome: Err(refused.0),
+                        logs: logs.into_inner(),
+                    });
                 }
-                let bank = e.section(&format!(".nv.constant2.{}", functions[si].name));
+                let bank = const2_sec[slot];
                 let found = |base: usize, places: &[u64]| {
                     bank.is_some_and(|bi| {
                         let data = &e.sections[bi].data;
@@ -946,39 +1065,63 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                     })
                 };
                 if tr.relocate.iter().any(|(base, places)| !found(*base as usize, places)) {
-                    why = Some("a jump table is not in the constants where its load reads it".into());
-                    break;
+                    let _ = si;
+                    return Ok(GroupOutput {
+                        outcome: Err("a jump table is not in the constants where its load reads it".into()),
+                        logs: logs.into_inner(),
+                    });
                 }
             }
+
+            for (_, tr) in &mut done {
+                tr.count = count;
+            }
+            Ok(GroupOutput {
+                outcome: Ok(done),
+                logs: logs.into_inner(),
+            })
+        },
+    )
+    .expect("group translation returns Result inside GroupOutput");
+
+    // Reassemble group outputs deterministically (replay logs sorted by group min-slot to avoid interleaving).
+    let mut results: Vec<Option<TransResult>> = (0..n_texts).map(|_| None).collect();
+    let mut indexed_outputs: Vec<(usize, Vec<usize>, GroupOutput)> = active_groups
+        .into_iter()
+        .zip(group_outputs)
+        .map(|((_, gslots), out)| (gslots[0], gslots, out))
+        .collect();
+    indexed_outputs.sort_by_key(|(min_slot, _, _)| *min_slot);
+    for (_, gslots, gout) in indexed_outputs {
+        for msg in gout.logs {
+            eprintln!("{msg}");
         }
-        match why {
-            Some(why) => {
-                for i in indices {
-                    set_report(&mut report, &functions[i].name, &why);
+        match gout.outcome {
+            Ok(done) => {
+                for (si, tr) in done {
+                    let slot = text_slot[&si];
+                    results[slot] = Some(tr);
                 }
             }
-            None => {
-                let count = done.iter().map(|(_, tr)| tr.count).max().unwrap_or(0);
-                for (si, mut tr) in done {
-                    tr.count = count;
-                    results.insert(si, tr);
+            Err(why) => {
+                for slot in gslots {
+                    report_reasons[slot] = Some(why.clone());
                 }
             }
         }
     }
 
-    // Build the listing, and what the validator is told beside it
+    // Build the listing, and what the validator is told beside it.
     let mut listing: Option<Vec<MapEntry>> = if want_map { Some(Vec::new()) } else { None };
     let mut lives: Option<Vec<LifeEntry>> = if want_map { Some(Vec::new()) } else { None };
 
-    // Update the container
-    let mut counts: HashMap<u32, u32> = HashMap::new();
-    let mut frames: HashMap<u32, u32> = HashMap::new();
-    let mut symbols = symbols;
+    // Update the container.
+    let mut counts: FastMap<u32, u32> = FastMap::default();
+    let mut frames: FastMap<u32, u32> = FastMap::default();
 
-    for &si in &texts {
+    for (slot, &si) in texts.iter().enumerate() {
         let name = e.sections[si].name[".text.".len()..].to_string();
-        if let Some(tr) = results.get(&si) {
+        if let Some(ref tr) = results[slot] {
             if let Some(ref mut map) = listing {
                 for (k, item) in tr.items.iter().enumerate() {
                     map.push((
@@ -1000,18 +1143,15 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
             if tr.frame_bytes > 0 {
                 frames.insert(e.sections[si].info & 0xffffff, tr.frame_bytes);
             }
-            let info_name = format!(".nv.info.{}", name);
-            if let Some(ii) = e.section(&info_name) {
+            if let Some(ii) = info_sec[slot] {
                 e.sections[ii].data = rewrite_attributes(&e.sections[ii].data, &tr.new_of);
             }
             if let Some(list) = relocations.get(&si) {
-                // Relocations: each one to where its instruction is now.
                 for (r, now) in list.iter().zip(&tr.moved) {
                     e.sections[r.section].data[r.at..r.at + 8].copy_from_slice(&now.to_le_bytes());
                 }
             }
-            if let Some(bi) = e.section(&format!(".nv.constant2.{}", name)) {
-                // Jump tables: their places as they were, to where they are now.
+            if let Some(bi) = const2_sec[slot] {
                 for (base, places) in &tr.relocate {
                     for (j, place) in places.iter().enumerate() {
                         let at = *base as usize + 4 * j;
@@ -1019,33 +1159,20 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                     }
                 }
             }
-            for sym in &mut symbols {
-                if sym.shndx as usize == si {
-                    if let Some(&new_off) = tr.new_of.get(&sym.value) {
-                        sym.value = new_off;
-                    } else if sym.value != 0 {
-                        set_report(
-                            &mut report,
-                            &name,
-                            &format!("a symbol at 0x{:x}, which is not an instruction", sym.value),
-                        );
-                    }
-                    if sym.info & 0xf == 2 {
-                        // An accepted sm_80 local helper fills the tail of its section.
-                        sym.size = tr.code.len() as u64 - if arch == 80 { sym.value } else { 0 };
-                    }
+            for &sym_idx in &symbols_by_text[slot] {
+                let sym = &mut symbols[sym_idx];
+                if let Some(&new_val) = tr.new_of.get(&sym.value) {
+                    sym.value = new_val;
+                } else if sym.value != 0 {
+                    report_reasons[slot] = Some(format!("a symbol at 0x{:x}, which is not an instruction", sym.value));
+                }
+                if sym.info & 0xf == 2 {
+                    sym.size = tr.code.len() as u64 - if arch == 80 { sym.value } else { 0 };
                 }
             }
         } else {
-            // Refused function. Never to run: the proxy refuses its kernels. What reads the file
-            // must still find valid sm_70 code that agrees with its attributes (the driver visits
-            // the instructions they list): instructions that do nothing, an EXIT wherever one is
-            // recorded, and no other record of an instruction. Should it be launched all the same,
-            // it must not pass for a kernel that ran: it starts with a trap, as the compiler
-            // writes one.
-            let info_name = format!(".nv.info.{}", name);
             let mut exits = Vec::new();
-            if let Some(ii) = e.section(&info_name) {
+            if let Some(ii) = info_sec[slot] {
                 exits = find_exits(&e.sections[ii].data);
                 e.sections[ii].data = strip_attributes(&e.sections[ii].data);
             }
@@ -1081,9 +1208,9 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
     e.set_symbols(&symbols);
 
     // Update global info
-    if let Some(ii) = e.section(".nv.info") {
+    if let Some(ii) = nv_info_sec {
         let d = &mut e.sections[ii].data;
-        let mut raised: HashSet<(u32, u8)> = HashSet::new();
+        let mut raised: FastSet<(u32, u8)> = FastSet::default();
         let mut pos = 0;
         while pos + 4 <= d.len() {
             let fmt = d[pos];
@@ -1095,7 +1222,6 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                     d[pos + 8..pos + 12].copy_from_slice(&count.to_le_bytes());
                 }
             }
-            // The frame of a function: more by the frame the translation added (level 3).
             if fmt == 4 && (attr == 0x11 || attr == 0x12 || attr == 0x23) && pos + 12 <= d.len() {
                 let symbol = u32::from_le_bytes(d[pos + 4..pos + 8].try_into().unwrap());
                 if let Some(&frame) = frames.get(&symbol) {
@@ -1106,7 +1232,6 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
             }
             pos += if fmt == 4 { 4 + val } else { 4 };
         }
-        // Check that every function with a frame has both 0x11 and 0x12 raised.
         for &symbol in frames.keys() {
             if !raised.contains(&(symbol, 0x11)) || !raised.contains(&(symbol, 0x12)) {
                 return Err("a frame was added to a function that has no frame attributes to raise".into());
@@ -1119,10 +1244,6 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
         e.header[7] = 0x33;
         e.header[8] = 7;
         e.header[0x14..0x18].copy_from_slice(&0x80u32.to_le_bytes());
-        // Machine code for sm_70 that still says it was compiled for the architecture 7.5 (what
-        // `cudaFuncGetAttributes` gives as `ptxVersion`): a program chooses by it among what it
-        // was built with (the algorithms of Thrust and CUB answer "invalid device function" to an
-        // architecture below the lowest of theirs), and it was built for nothing below.
         let elf_flags = (u32::from(arch) << 16) | 0x0500 | 70;
         e.header[0x30..0x34].copy_from_slice(&elf_flags.to_le_bytes());
         for s in &mut e.sections {
@@ -1140,15 +1261,15 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
 
     let ordered_report: Vec<FunctionReport> = texts
         .iter()
-        .zip(before)
-        .map(|(&si, before)| {
+        .enumerate()
+        .map(|(slot, &si)| {
             let name = e.sections[si].name[".text.".len()..].to_string();
-            let refused = report.iter().find(|(n, _)| n == &name).and_then(|(_, r)| r.clone());
+            let refused = report_reasons[slot].clone();
             FunctionReport {
                 name,
-                paired: refused.is_none() && results.get(&si).is_some_and(|tr| tr.paired),
+                paired: refused.is_none() && results[slot].as_ref().is_some_and(|tr| tr.paired),
                 refused,
-                before,
+                before: before[slot],
                 after: e.sections[si].data.len() / 16,
             }
         })
@@ -1160,10 +1281,4 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
         map: listing,
         lives,
     })
-}
-
-fn set_report(report: &mut [(String, Option<String>)], name: &str, reason: &str) {
-    if let Some(entry) = report.iter_mut().find(|(n, _)| n == name) {
-        entry.1 = Some(reason.to_string());
-    }
 }

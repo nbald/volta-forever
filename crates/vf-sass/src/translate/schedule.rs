@@ -3,9 +3,9 @@
 //! what the translation added (saves, restores, waits for borrowed registers) in the
 //! same pass as the program's own instructions.
 
-use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
-use crate::decode::{Decoded, Kind, LETTER_P};
+use crate::decode::{Decoded, Kind, LETTER_P, LETTER_R};
 use crate::generated::fields::*;
 use crate::generated::special::*;
 
@@ -13,12 +13,41 @@ use super::{Item, Refused, marked, stall_of, with_stall};
 
 // ---- Scheduling ----
 
+const REG_SLOTS: usize = 264; // 0..256: R0..255, 256..264: P0..7
+
+#[inline]
+fn slot_of(letter: u8, reg: u32) -> Option<usize> {
+    if letter == LETTER_R && reg < 256 {
+        Some(reg as usize)
+    } else if letter == LETTER_P && reg < 8 {
+        Some(256 + reg as usize)
+    } else {
+        None
+    }
+}
+
+#[inline]
+fn slot_letter(slot: usize) -> u8 {
+    if slot < 256 { LETTER_R } else { LETTER_P }
+}
+
 pub(super) fn schedule(items: &mut Vec<Item>, targets: &[u64]) -> Result<(), Refused> {
+    let max_origin = items.iter().map(|it| it.origin).max().unwrap_or(0);
+    let mut is_target = vec![false; max_origin + 1];
+    for &t in targets {
+        if t.is_multiple_of(16) {
+            let idx = (t / 16) as usize;
+            if idx < is_target.len() {
+                is_target[idx] = true;
+            }
+        }
+    }
+
     // Split into basic blocks
     let mut blocks: Vec<(usize, usize)> = Vec::new();
     let mut start = 0;
     for (k, item) in items.iter().enumerate() {
-        if k > start && item.first && targets.contains(&(16 * item.origin as u64)) {
+        if k > start && item.first && is_target[item.origin] {
             blocks.push((start, k));
             start = k;
         }
@@ -33,11 +62,34 @@ pub(super) fn schedule(items: &mut Vec<Item>, targets: &[u64]) -> Result<(), Ref
 
     let mut inserted: Vec<(usize, u128)> = Vec::new();
     let mut t: i32 = 0;
+
+    type ExtraLastEntry = ((u8, u32), (i32, usize, bool));
+    type ExtraReadEntry = ((u8, u32), (i32, Kind));
+
     // When each register or predicate was last written, by which item, and whether through the
     // mask of an R2P of the program (`masked`).
-    let mut last: HashMap<(u8, u32), (i32, usize, bool)> = HashMap::new();
+    let mut last_gen = [0u32; REG_SLOTS];
+    let mut last_val = [(0i32, 0usize, false); REG_SLOTS];
+    let mut last_epoch: u32 = 1;
+    let mut active_last: Vec<u16> = Vec::with_capacity(64);
+    let mut extra_last: Vec<ExtraLastEntry> = Vec::new();
+
     // The writers whose scoreboard an instruction since has waited for.
-    let mut waited: HashSet<usize> = HashSet::new();
+    let mut waited_gen = vec![0u32; items.len()];
+    let mut waited_epoch: u32 = 1;
+
+    // The time and kind of the last reader of each register, reset per block.
+    let mut read_gen = [0u32; REG_SLOTS];
+    let mut read_val = [(0i32, Kind::OTHER); REG_SLOTS];
+    let mut read_epoch: u32 = 1;
+    let mut extra_read: Vec<ExtraReadEntry> = Vec::new();
+
+    let mut reads_buf: Vec<(u8, u32, u8)> = Vec::new();
+    let mut writes_buf: Vec<(u8, u32)> = Vec::new();
+    let mut through_buf: Vec<(u8, u32, u8)> = Vec::new();
+    let mut made_up_buf: Vec<(u8, u32, u8)> = Vec::new();
+    let mut masked_buf: Vec<(u8, u32)> = Vec::new();
+
     for &(a, b) in &blocks {
         // What was written before this block, and when, is known where the code before it goes
         // on into it (past a label, a branch not taken, the mark of a region): an instruction
@@ -47,37 +99,84 @@ pub(super) fn schedule(items: &mut Vec<Item>, targets: &[u64]) -> Result<(), Ref
         let continued = goes_on(items, a);
         if !continued {
             t = 0;
-            last.clear();
-            waited.clear();
+            last_epoch += 1;
+            if last_epoch == 0 {
+                last_gen.fill(0);
+                last_epoch = 1;
+            }
+            active_last.clear();
+            extra_last.clear();
+            waited_epoch += 1;
+            if waited_epoch == 0 {
+                waited_gen.fill(0);
+                waited_epoch = 1;
+            }
         }
-        // The time and kind of the last reader of each register.
-        let mut read_at: HashMap<(u8, u32), (i32, Kind)> = HashMap::new();
+        read_epoch += 1;
+        if read_epoch == 0 {
+            read_gen.fill(0);
+            read_epoch = 1;
+        }
+        extra_read.clear();
+
         for k in a..b {
-            // Collect what we need from items[k] before potentially modifying items
             let item_changed = items[k].changed;
             let item_origin = items[k].origin;
-            let d = items[k].d.as_ref().unwrap().clone();
-            // (With what it reads and writes that its operands do not say.)
-            let reads: Vec<(u8, u32, u8)> = d.reads.iter().chain(&items[k].more_reads).copied().collect();
-            let writes: Vec<(u8, u32)> = d.writes.iter().chain(&items[k].more_writes).copied().collect();
-            // The reads that the translation made up, and those of a mask: nothing of the
-            // program's instruction says them.
-            let through_mask = all_predicates(&d, &reads);
-            let made_up: Vec<(u8, u32, u8)> = items[k]
-                .more_reads
-                .iter()
-                .copied()
-                .chain(through_mask.iter().copied())
-                .collect();
+            let d: Arc<Decoded> = Arc::clone(items[k].d.as_ref().unwrap());
+            let has_more_reads = !items[k].more_reads.is_empty();
+            let has_more_writes = !items[k].more_writes.is_empty();
+            let is_mask_op = d.mnemonic == "P2R" || d.mnemonic == "R2P";
+
+            let reads_slice: &[(u8, u32, u8)] = if has_more_reads {
+                reads_buf.clear();
+                reads_buf.extend_from_slice(&d.reads);
+                reads_buf.extend_from_slice(&items[k].more_reads);
+                &reads_buf
+            } else {
+                &d.reads
+            };
+
+            let writes_slice: &[(u8, u32)] = if has_more_writes {
+                writes_buf.clear();
+                writes_buf.extend_from_slice(&d.writes);
+                writes_buf.extend_from_slice(&items[k].more_writes);
+                &writes_buf
+            } else {
+                &d.writes
+            };
+
+            let has_made_up = has_more_reads || is_mask_op;
+            if is_mask_op {
+                fill_all_predicates(&d, reads_slice, &mut through_buf);
+            } else {
+                through_buf.clear();
+            }
+            if has_made_up {
+                made_up_buf.clear();
+                made_up_buf.extend_from_slice(&items[k].more_reads);
+                made_up_buf.extend_from_slice(&through_buf);
+            } else {
+                made_up_buf.clear();
+            }
+
             let mut need: i32 = 0;
-            for &(letter, register, role) in d.reads.iter().chain(&made_up) {
-                if let Some(&(wt, wi, through)) = last.get(&(letter, register)) {
+            for &(letter, register, role) in d.reads.iter().chain(made_up_buf.iter()) {
+                let found = match slot_of(letter, register) {
+                    Some(slot) if last_gen[slot] == last_epoch => Some(last_val[slot]),
+                    Some(_) => None,
+                    None => extra_last
+                        .iter()
+                        .find(|&&(k_reg, _)| k_reg == (letter, register))
+                        .map(|&(_, v)| v),
+                };
+                if let Some((wt, wi, through)) = found {
                     let wr_changed = items[wi].changed;
                     let wr_word = items[wi].word;
                     if !(wr_changed || item_changed) {
                         continue;
                     }
-                    if through && !made_up.contains(&(letter, register, role)) {
+                    let is_made = has_made_up && made_up_buf.contains(&(letter, register, role));
+                    if through && !is_made {
                         // (Written through the mask of an R2P of the program, and read by what
                         // the program's instruction read: as far as the compiler had them.)
                         continue;
@@ -88,10 +187,7 @@ pub(super) fn schedule(items: &mut Vec<Item>, targets: &[u64]) -> Result<(), Ref
                         // translation made up (a predicate saved, written down, or all of them
                         // for R2P) has nothing of the program that waits for it: it does here,
                         // unless an instruction since has waited for that scoreboard (`waited`).
-                        if made_up.contains(&(letter, register, role))
-                            && ((wr_word >> WRITE_BARRIER) & 7) != 7
-                            && !waited.contains(&wi)
-                        {
+                        if is_made && ((wr_word >> WRITE_BARRIER) & 7) != 7 && waited_gen[wi] != waited_epoch {
                             if !item_changed {
                                 return Err(Refused(format!(
                                     "the {} at 0x{:x} reads a predicate of the translation that a scoreboard announces",
@@ -127,8 +223,16 @@ pub(super) fn schedule(items: &mut Vec<Item>, targets: &[u64]) -> Result<(), Ref
             // schedule does not see, is close enough for the R2P to undo (`all_predicates`).
             // What R2P writes is in a mask: `more_writes`.
             if item_changed && (!matches!(d.kind, Kind::FXU | Kind::IMAD | Kind::FMAI) || d.mnemonic == "R2P") {
-                for &(letter, register) in &writes {
-                    if let Some(&(rt, reader_kind)) = read_at.get(&(letter, register))
+                for &(letter, register) in writes_slice {
+                    let found = match slot_of(letter, register) {
+                        Some(slot) if read_gen[slot] == read_epoch => Some(read_val[slot]),
+                        Some(_) => None,
+                        None => extra_read
+                            .iter()
+                            .find(|&&(k_reg, _)| k_reg == (letter, register))
+                            .map(|&(_, v)| v),
+                    };
+                    if let Some((rt, reader_kind)) = found
                         && !(d.kind == Kind::HMMA && reader_kind == Kind::HMMA)
                     {
                         need = need.max(rt + 9 - t);
@@ -146,29 +250,87 @@ pub(super) fn schedule(items: &mut Vec<Item>, targets: &[u64]) -> Result<(), Ref
             }
             // (As a reader for the nine cycles above: a P2R with the predicates of its mask; not
             // an R2P with those it only writes back.)
-            for &(letter, register, _) in &reads {
-                read_at.insert((letter, register), (t, d.kind));
+            let record_read = |letter: u8,
+                               register: u32,
+                               read_gen: &mut [u32; REG_SLOTS],
+                               read_val: &mut [(i32, Kind); REG_SLOTS],
+                               extra_read: &mut Vec<ExtraReadEntry>| {
+                if let Some(slot) = slot_of(letter, register) {
+                    read_gen[slot] = read_epoch;
+                    read_val[slot] = (t, d.kind);
+                } else if let Some(entry) = extra_read.iter_mut().find(|(k_reg, _)| *k_reg == (letter, register)) {
+                    entry.1 = (t, d.kind);
+                } else {
+                    extra_read.push(((letter, register), (t, d.kind)));
+                }
+            };
+            for &(letter, register, _) in reads_slice {
+                record_read(letter, register, &mut read_gen, &mut read_val, &mut extra_read);
             }
             if d.mnemonic == "P2R" {
-                for &(letter, register, _) in &through_mask {
-                    read_at.insert((letter, register), (t, d.kind));
+                for &(letter, register, _) in &through_buf {
+                    record_read(letter, register, &mut read_gen, &mut read_val, &mut extra_read);
                 }
             }
             // (What this instruction waits for is there when it is issued: the writers that
             // announced on those scoreboards are waited for.)
             let boards = (items[k].word >> WAIT) & 63;
             if boards != 0 {
-                for &(_, wi, _) in last.values() {
+                for &slot in &active_last {
+                    let wi = last_val[slot as usize].1;
                     if (boards >> ((items[wi].word >> WRITE_BARRIER) & 7)) & 1 != 0 {
-                        waited.insert(wi);
+                        waited_gen[wi] = waited_epoch;
+                    }
+                }
+                for &(_, (_, wi, _)) in &extra_last {
+                    if (boards >> ((items[wi].word >> WRITE_BARRIER) & 7)) & 1 != 0 {
+                        waited_gen[wi] = waited_epoch;
                     }
                 }
             }
-            for &(letter, register) in &writes {
-                last.insert((letter, register), (t, k, false));
+            let record_write = |letter: u8,
+                                register: u32,
+                                val: (i32, usize, bool),
+                                last_gen: &mut [u32; REG_SLOTS],
+                                last_val: &mut [(i32, usize, bool); REG_SLOTS],
+                                active_last: &mut Vec<u16>,
+                                extra_last: &mut Vec<ExtraLastEntry>| {
+                if let Some(slot) = slot_of(letter, register) {
+                    if last_gen[slot] != last_epoch {
+                        last_gen[slot] = last_epoch;
+                        active_last.push(slot as u16);
+                    }
+                    last_val[slot] = val;
+                } else if let Some(entry) = extra_last.iter_mut().find(|(k_reg, _)| *k_reg == (letter, register)) {
+                    entry.1 = val;
+                } else {
+                    extra_last.push(((letter, register), val));
+                }
+            };
+            for &(letter, register) in writes_slice {
+                record_write(
+                    letter,
+                    register,
+                    (t, k, false),
+                    &mut last_gen,
+                    &mut last_val,
+                    &mut active_last,
+                    &mut extra_last,
+                );
             }
-            for (letter, register) in masked(&d, &writes) {
-                last.insert((letter, register), (t, k, true));
+            if d.mnemonic == "R2P" {
+                fill_masked(&d, writes_slice, &mut masked_buf);
+                for &(letter, register) in &masked_buf {
+                    record_write(
+                        letter,
+                        register,
+                        (t, k, true),
+                        &mut last_gen,
+                        &mut last_val,
+                        &mut active_last,
+                        &mut extra_last,
+                    );
+                }
             }
             t += stall_of(items[k].word) as i32;
         }
@@ -179,12 +341,12 @@ pub(super) fn schedule(items: &mut Vec<Item>, targets: &[u64]) -> Result<(), Ref
             b - 2
         };
         let mut need: i32 = 0;
-        for (&(letter, _register), &(when, wi, _)) in &last {
+        let check_tail = |letter: u8, when: i32, wi: usize, need: &mut i32| {
             let wr_changed = items[wi].changed;
             let wr_word = items[wi].word;
             if wr_changed && ((wr_word >> WRITE_BARRIER) & 7) == 7 && !items[wi].covered && wi != b - 1 {
                 let wd = items[wi].d.as_ref().unwrap();
-                need = need.max(when + crate::distance::longest(letter, wd) as i32 - t);
+                *need = (*need).max(when + crate::distance::longest(letter, wd) as i32 - t);
             }
             // (A result of double precision of code for sm_80, scoreboard or not: its reader
             // may be the first instruction where a branch goes, which waits and is still too
@@ -194,14 +356,29 @@ pub(super) fn schedule(items: &mut Vec<Item>, targets: &[u64]) -> Result<(), Ref
                 && wi != b - 1
                 && let Some(floor) = crate::distance::waited_longest(letter, items[wi].d.as_ref().unwrap())
             {
-                need = need.max(when + floor as i32 - t);
+                *need = (*need).max(when + floor as i32 - t);
             }
+        };
+        for &slot in &active_last {
+            let (when, wi, _) = last_val[slot as usize];
+            check_tail(slot_letter(slot as usize), when, wi, &mut need);
         }
-        let wd = items[b - 1].d.as_ref().unwrap().clone();
-        let writes: Vec<(u8, u32)> = wd.writes.iter().chain(&items[b - 1].more_writes).copied().collect();
-        if items[b - 1].changed && !writes.is_empty() && ((items[b - 1].word >> WRITE_BARRIER) & 7) == 7 {
+        for &((letter, _), (when, wi, _)) in &extra_last {
+            check_tail(letter, when, wi, &mut need);
+        }
+        let wd: Arc<Decoded> = Arc::clone(items[b - 1].d.as_ref().unwrap());
+        let has_tail_more = !items[b - 1].more_writes.is_empty();
+        let tail_writes: &[(u8, u32)] = if has_tail_more {
+            writes_buf.clear();
+            writes_buf.extend_from_slice(&wd.writes);
+            writes_buf.extend_from_slice(&items[b - 1].more_writes);
+            &writes_buf
+        } else {
+            &wd.writes
+        };
+        if items[b - 1].changed && !tail_writes.is_empty() && ((items[b - 1].word >> WRITE_BARRIER) & 7) == 7 {
             tail_idx = b - 1;
-            for &(l, _) in &writes {
+            for &(l, _) in tail_writes {
                 need = need.max(crate::distance::longest(l, &wd) as i32 - stall_of(items[b - 1].word) as i32);
             }
         }
@@ -218,13 +395,22 @@ pub(super) fn schedule(items: &mut Vec<Item>, targets: &[u64]) -> Result<(), Ref
         }
     }
 
-    // Insert NOP fillers
-    inserted.sort_by(|a, b| b.cmp(a));
-    for (k, word) in inserted {
-        let origin = items[k].origin;
-        // `finish` decodes it.
-        items.insert(k + 1, Item::new(word, origin, "wait", true));
+    // Insert NOP fillers in O(N) while preserving ascending `(k, word)` insertion order.
+    if !inserted.is_empty() {
+        inserted.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        let mut rebuilt = Vec::with_capacity(items.len() + inserted.len());
+        let mut ins_idx = 0usize;
+        for (k, item) in items.drain(..).enumerate() {
+            let origin = item.origin;
+            rebuilt.push(item);
+            while ins_idx < inserted.len() && inserted[ins_idx].0 == k {
+                rebuilt.push(Item::new(inserted[ins_idx].1, origin, "wait", true));
+                ins_idx += 1;
+            }
+        }
+        *items = rebuilt;
     }
+
     // A wait for a scoreboard comes two cycles or more after the instruction that names it, for
     // its result or for having read: native code of both architectures never has less. The
     // translation adds waits and names.
@@ -274,22 +460,8 @@ fn goes_on(items: &[Item], a: usize) -> bool {
     d.mnemonic == "BRA" && !always
 }
 
-/// What a P2R or an R2P reads of the predicates, which its operands (`reads`) do not say (they
-/// are a mask, a number).
-///
-/// A P2R reads those of its mask.
-///
-/// An R2P reads all seven and writes them all back, those of its mask from its register and the
-/// others as it read them; so a predicate outside its mask that an instruction wrote less than 4
-/// cycles before it (5 for another R2P) gets its former value back. Measured on a V100,
-/// 2026-11-18 (ISETP, PLOP3 or the carries of IADD3 1 to 3 cycles before an R2P of
-/// another predicate are undone; two R2P of one predicate each, 1 to 4 cycles apart, lose the
-/// first). Native sm_70 code has no writer of any predicate closer than 4 cycles before an R2P
-/// (8,101 of them in PyTorch's and cuBLAS's). The translation had restores one cycle apart (two
-/// predicates saved around one instruction) and so lost the first. (Not the predicates of its
-/// mask, which get the register's bits whatever they held; a mask that is not a number: any of
-/// them may be left as it was.)
-fn all_predicates(d: &Decoded, reads: &[(u8, u32, u8)]) -> Vec<(u8, u32, u8)> {
+fn fill_all_predicates(d: &Decoded, reads: &[(u8, u32, u8)], out: &mut Vec<(u8, u32, u8)>) {
+    out.clear();
     let named = |p: u32| reads.iter().any(|&(l, r, _)| l == LETTER_P && r == p);
     let wanted: u32 = match d.mnemonic {
         "P2R" => d.op_or(OP_SB, 0x7f) & 0x7f,
@@ -302,30 +474,28 @@ fn all_predicates(d: &Decoded, reads: &[(u8, u32, u8)]) -> Vec<(u8, u32, u8)> {
         }
         _ => 0,
     };
-    (0..7u32)
-        .filter(|&p| (wanted >> p) & 1 != 0 && !named(p))
-        .map(|p| (LETTER_P, p, 0u8))
-        .collect()
+    for p in 0..7u32 {
+        if (wanted >> p) & 1 != 0 && !named(p) {
+            out.push((LETTER_P, p, 0u8));
+        }
+    }
 }
 
-/// What an R2P writes of the predicates, which its operands (`writes`) do not say: those of its
-/// mask (any of them when the mask is not a number). The program's own R2P is a writer like any
-/// other for what the translation reads after it: a predicate saved (P2R) one to four cycles
-/// after the program's R2P gave it a value was saved as it was before (cuDNN's kernels had the
-/// case, found by validate.py on the held-out corpus the day R2P was measured).
-fn masked(d: &Decoded, writes: &[(u8, u32)]) -> Vec<(u8, u32)> {
+fn fill_masked(d: &Decoded, writes: &[(u8, u32)], out: &mut Vec<(u8, u32)>) {
+    out.clear();
     if d.mnemonic != "R2P" {
-        return Vec::new();
+        return;
     }
     let mask = if d.name == "r2p__RIR" {
         d.op_or(OP_SB, 0x7f) & 0x7f
     } else {
         0x7f
     };
-    (0..7u32)
-        .filter(|&p| (mask >> p) & 1 != 0 && !writes.contains(&(LETTER_P, p)))
-        .map(|p| (LETTER_P, p))
-        .collect()
+    for p in 0..7u32 {
+        if (mask >> p) & 1 != 0 && !writes.contains(&(LETTER_P, p)) {
+            out.push((LETTER_P, p));
+        }
+    }
 }
 
 fn delay(items: &mut [Item], k: usize, cycles: u32, inserted: &mut Vec<(usize, u128)>) -> u32 {

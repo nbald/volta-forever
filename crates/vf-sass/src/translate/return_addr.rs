@@ -19,6 +19,15 @@ pub(super) fn return_addresses(
     fd: &FuncData,
 ) -> Result<Vec<(u32, Vec<u64>)>, Refused> {
     let src = &fd.src;
+    let mut is_target = vec![false; src.len()];
+    for &t in targets {
+        if t.is_multiple_of(16) {
+            let idx = (t / 16) as usize;
+            if idx < is_target.len() {
+                is_target[idx] = true;
+            }
+        }
+    }
     let mut relocate: Vec<(u32, Vec<u64>)> = Vec::new();
     // Build MOV immediate index: immediate value -> list of item indices
     let mut movs: HashMap<u32, Vec<usize>> = HashMap::new();
@@ -52,7 +61,7 @@ pub(super) fn return_addresses(
             let straight = define.is_some_and(|define| {
                 !(define + 1..k).any(|j| {
                     let between = items[j].d.as_ref().unwrap();
-                    (items[j].first && targets.contains(&(16 * items[j].origin as u64)))
+                    (items[j].first && is_target.get(items[j].origin).copied().unwrap_or(false))
                         || (between.kind == Kind::BRU && !matches!(between.mnemonic, "BSSY" | "BMOV"))
                 })
             });
@@ -75,7 +84,7 @@ pub(super) fn return_addresses(
                 )));
             }
             let back = (16 * origin + 16) as u32;
-            let found: Vec<usize> = movs.get(&back).cloned().unwrap_or_default();
+            let found: &[usize] = movs.get(&back).map_or(&[], Vec::as_slice);
             if found.len() != 1 || found[0] > k {
                 return Err(Refused(format!(
                     "the return address of the call at 0x{:x} is not given by exactly one MOV",
@@ -87,7 +96,7 @@ pub(super) fn return_addresses(
             for between in &items[j + 1..k] {
                 let bd = between.d.as_ref().unwrap();
                 if bd.writes.iter().any(|&(l, r)| l == LETTER_R && r == register)
-                    || (between.first && targets.contains(&(16 * between.origin as u64)))
+                    || (between.first && is_target.get(between.origin).copied().unwrap_or(false))
                     || bd.kind == Kind::BRU
                 {
                     return Err(Refused(format!(
@@ -168,7 +177,8 @@ pub(super) fn return_addresses(
                     }
                 };
                 // Check no branch target between define and call
-                if (define + 1..=k).any(|j| items[j].first && targets.contains(&(16 * items[j].origin as u64))) {
+                if (define + 1..=k).any(|j| items[j].first && is_target.get(items[j].origin).copied().unwrap_or(false))
+                {
                     return Err(Refused(format!(
                         "the call at 0x{:x}: a term of its return address is not a MOV before it",
                         16 * origin
@@ -176,7 +186,7 @@ pub(super) fn return_addresses(
                 }
                 values.insert(negated, define);
             }
-            if (lepc + 1..=k).any(|j| items[j].first && targets.contains(&(16 * items[j].origin as u64))) {
+            if (lepc + 1..=k).any(|j| items[j].first && is_target.get(items[j].origin).copied().unwrap_or(false)) {
                 return Err(Refused(format!(
                     "the call at 0x{:x}: a branch arrives between LEPC and the call",
                     16 * origin
