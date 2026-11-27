@@ -473,6 +473,7 @@ mc k_uniform 4
 mc k_params 3
 mc k_uniform_math 2
 mc k_uimad 2
+mc k_uflo 3
 mc k_switch 12
 mc k_memory 7
 mc k_convert 2
@@ -495,6 +496,11 @@ check translated-waits-moved "SUMMARY: 7 PASS, 0 FAIL"
 log=$out/logs/translated-guard-written.log
 VF_BORROW=8 LD_LIBRARY_PATH=$proxy VF_LOG_LEVEL=1 "$out/bin/diffrun" "$G/translate/k_guards.sm70.cubin" "$G/translate/k_guards.guard-written.sm75.cubin" >"$log" 2>&1
 check translated-guard-written "SUMMARY: 3 PASS, 0 FAIL" "3 kernels with emulated instructions were given to the program"
+# The uniform find-leading-one kernels under level-3 register borrowing (VF_BORROW=8):
+# UFLO becomes FLO (MIO_FAST / LATE) and must announce its borrowed write scoreboard and wait.
+log=$out/logs/translated-uflo-borrow8.log
+VF_BORROW=8 LD_LIBRARY_PATH=$proxy VF_LOG_LEVEL=1 "$out/bin/diffrun" "$out/translate/k_uflo.sm70.cubin" "$out/translate/k_uflo.sm75.cubin" >"$log" 2>&1
+check translated-uflo-borrow8 "SUMMARY: 3 PASS, 0 FAIL" "3 kernels with emulated instructions were given to the program"
 
 
 for lazy in 0 1; do

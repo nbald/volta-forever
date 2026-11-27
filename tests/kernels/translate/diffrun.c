@@ -961,6 +961,17 @@ int main(int argc, char** argv) {
         cuMemFree_v2(dw);
     }
 
+    // k_uflo.cu: uniform find-leading-one (`UFLO` -> `FLO`).
+    {
+        int n = N;
+        uint32_t mask = 0x13579bdfu;
+        int32_t seed = -73;
+        CK(cuMemcpyHtoD_v2(da, ha, N * 4));
+        test_same_output("k_uflo_u32", rm, tm, N * 4, (void*[]){&da, &n, &mask}, 3);
+        test_same_output("k_uflo_s32", rm, tm, N * 4, (void*[]){&da, &n, &seed}, 3);
+        test_same_output("k_uflo_u32_sh", rm, tm, N * 4, (void*[]){&da, &n, &mask}, 3);
+    }
+
     // k_switch.cu: jump tables (a table of code offsets in the constants, a branch through a register).
     {
         int n = N;

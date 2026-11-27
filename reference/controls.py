@@ -18,6 +18,9 @@ sm_75 cubins named with it, and counts what validate.py finds. A control that pa
                 predicates are a mask, a number: the tables do not say which)
     nowait      the instruction after one that reads late a register of the translation does not
                 wait for it
+    late_rule_nowait
+                the instruction after a late writer translated from a non-late instruction under
+                no scoreboard does not wait for its write scoreboard
     close       a wait comes one cycle after the instruction that names its scoreboard
     doublesoon  the instruction after an instruction of double precision, which reads its
                 result, comes 6 cycles after it, as in code for sm_80 (Volta's own code has 8 or
@@ -142,6 +145,8 @@ at the default; with VF_BORROW=1 every function does:
     no_late_borrow
                 an instruction of the program that reads a borrowed register late does not say
                 when it has read
+    late_writer a late writer (MIO_FAST or MIO_SLOW) that writes a borrowed register does not say
+                when it writes
     written_pair
                 the pair given at an instruction is one that the original instruction writes
     shared_home what the homes take is forgotten once they are chosen: a register given at an
@@ -864,6 +869,7 @@ def patched(control):
         'cut': {'liveness': cut},
         'masks': {'liveness': masks},
         'nowait': {'late': nowait},
+        'late_rule_nowait': {},
         'close': {'schedule': close},
         'doublesoon': {'schedule': doublesoon},
         'doubleacross': {'schedule': doubleacross},
@@ -913,6 +919,7 @@ def patched(control):
         'alive_home': {},
         'no_borrow_wait': {},
         'no_late_borrow': {},
+        'late_writer': {},
         'written_pair': {},
         'shared_home': {},
         'overlap_pool': {},
@@ -1339,12 +1346,12 @@ def patched(control):
     return all_controls[control]
 
 
-CONTROLS = ['as it is', 'unsaved', 'blind', 'cut', 'masks', 'nowait', 'close', 'doublesoon', 'doubleacross', 'returns', 'waitless', 'unlisted', 'swapped', 'batched', 'unmoved', 'named', 'unguarded', 'lanes', 'unwaited', 'unordered', 'complement_rewritten', 'complement_same', 'soon', 'partial', 'boardless', 'unmasked', 'early', 'unheld', 'unwritten', 'stale', 'unkept', 'unpaired', 'misruled', 'slowno', 'slowshort', 'slownowait', 'slownever', 'slowfree', 'slowsaved', 'alive_scratch']
+CONTROLS = ['as it is', 'unsaved', 'blind', 'cut', 'masks', 'nowait', 'late_rule_nowait', 'close', 'doublesoon', 'doubleacross', 'returns', 'waitless', 'unlisted', 'swapped', 'batched', 'unmoved', 'named', 'unguarded', 'lanes', 'unwaited', 'unordered', 'complement_rewritten', 'complement_same', 'soon', 'partial', 'boardless', 'unmasked', 'early', 'unheld', 'unwritten', 'stale', 'unkept', 'unpaired', 'misruled', 'slowno', 'slowshort', 'slownowait', 'slownever', 'slowfree', 'slowsaved', 'alive_scratch']
 # (Those of pairs of products on whole rows: only when the translator makes them, not with VF_PAIRS=0.)
 PAIR_CONTROLS = ['rowlane', 'otherrow', 'rowwait', 'rowread', 'halfswap', 'halfk', 'inplace', 'stepfast', 'unsettled', 'unsynced', 'unpermuted', 'unconverted', 'notalso']
 CONTROLS += PAIR_CONTROLS
 # (Those of borrowed registers: only when VF_BORROW=1.)
-BORROW_CONTROLS = ['alive_pair', 'alive_home', 'no_borrow_wait', 'no_late_borrow', 'written_pair', 'shared_home', 'overlap_pool', 'short_home', 'pool_in_home_unsaid']
+BORROW_CONTROLS = ['alive_pair', 'alive_home', 'no_borrow_wait', 'no_late_borrow', 'late_writer', 'written_pair', 'shared_home', 'overlap_pool', 'short_home', 'pool_in_home_unsaid']
 CONTROLS += BORROW_CONTROLS
 # (Those of level 3: only when VF_BORROW>=2 and a function uses the frame.)
 FRAME_CONTROLS = ['no_lane_l3', 'odd_pair_l3', 'no_r1_lower', 'wrong_r1_lower', 'wrong_slot_load', 'no_store_l3', 'held_busy_l3', 'unkept_holder_l3', 'shared_holder_l3', 'home_unsaid', 'guarded_store_l3', 'no_old_load_l3', 'no_load_wait', 'store_no_read_sb', 'wrong_base_const', 'missing_pool_line', 'room_lane_unsaid', 'no_attr_raise', 'no_borrow_wait_l3', 'no_c3_wait',
@@ -1938,6 +1945,56 @@ def run(mc, control, path, out_dir, untouched, validated=True):
                     pos += 4 + val if fmt == 4 else 4
                     opos += 4 + oval if ofmt == 4 else 4
                 s.data = bytes(d)
+        out = container.write()
+        if out == untouched[path]:
+            return None, ''
+    elif control == 'late_writer':
+        # A late writer (MIO_FAST or MIO_SLOW) of the translation that writes a borrowed register
+        # does not name a write scoreboard (WRITE_BARRIER = 7).
+        container = elf.Elf(out)
+        original = elf.Elf(source)
+        def highest(function):
+            sec = original.section('.text.' + function)
+            top = 0
+            for at in range(0, len(sec.data) if sec is not None else 0, 16):
+                d = mc.decode(75, int.from_bytes(sec.data[at:at + 16], 'little'))
+                if d is not None:
+                    top = max([top] + [r for letter, r, *role in d.reads + d.writes if letter == 'R'])
+            return top
+        borrowed = collections.defaultdict(set)
+        for row in lives or []:
+            if len(row) < 5:
+                continue
+            rname, a, b, kind = row[0], row[1], row[2], row[3]
+            h = highest(rname)
+            if kind in ('home', 'held') and 2 <= b <= h:
+                borrowed[rname].add(b)
+            elif kind in ('pool', 'room'):
+                borrowed[rname].update(r for r in range(b, b + a) if 2 <= r <= h)
+        changed = False
+        by_func = collections.defaultdict(list)
+        for row in listing:
+            by_func[row[0]].append(row)
+        for rname, rows in by_func.items():
+            bregs = borrowed.get(rname)
+            section = container.section('.text.' + rname)
+            if not bregs or section is None:
+                continue
+            data = bytearray(section.data)
+            for _, new_off, _, what in rows:
+                if what == 'same' or what.startswith('mem: ') or what.startswith('room: '):
+                    continue
+                word = int.from_bytes(data[new_off:new_off + 16], 'little')
+                d70 = mc.decode(70, word)
+                if d70 is None or d70.kind not in ('MIO_FAST', 'MIO_SLOW'):
+                    continue
+                if (word >> WRITE_BARRIER) & 7 != 7 and any(l == 'R' and r in bregs for l, r in d70.writes):
+                    word |= 7 << WRITE_BARRIER
+                    data[new_off:new_off + 16] = word.to_bytes(16, 'little')
+                    changed = True
+            section.data = bytes(data)
+        if not changed:
+            return None, ''
         out = container.write()
         if out == untouched[path]:
             return None, ''
@@ -2671,6 +2728,55 @@ def run(mc, control, path, out_dir, untouched, validated=True):
         if not changed:
             return None, ''
         out = container.write()
+    elif control == 'late_rule_nowait':
+        # A late writer (MIO_FAST or MIO_SLOW) translated from a non-late instruction under no
+        # scoreboard (such as UFLO -> FLO): clear the wait for its write scoreboard on the
+        # instructions that follow until the next non-NOP instruction.
+        container = elf.Elf(out)
+        original = elf.Elf(source)
+        by_func = collections.defaultdict(list)
+        for row in listing:
+            by_func[row[0]].append(row)
+        changed = False
+        nop_mask = ~(0x3ffff << machine.USCHED)
+        nop_bits = machine.NOP & nop_mask
+        for rname, rows in by_func.items():
+            section = container.section('.text.' + rname)
+            orig_sec = original.section('.text.' + rname)
+            if section is None or orig_sec is None:
+                continue
+            data = bytearray(section.data)
+            orig_data = orig_sec.data
+            for _, new_off, old_off, what in rows:
+                if what != 'ordinary registers' or old_off + 16 > len(orig_data):
+                    continue
+                w70 = int.from_bytes(data[new_off:new_off + 16], 'little')
+                d70 = mc.decode(70, w70)
+                if d70 is None or d70.kind not in ('MIO_FAST', 'MIO_SLOW'):
+                    continue
+                if not any(l == 'R' and r != 255 for l, r in d70.writes):
+                    continue
+                w75 = int.from_bytes(orig_data[old_off:old_off + 16], 'little')
+                d75 = mc.decode(75, w75)
+                if d75 is None or d75.kind in ('MIO_FAST', 'MIO_SLOW') or (w75 >> WRITE_BARRIER) & 7 != 7:
+                    continue
+                wb = (w70 >> WRITE_BARRIER) & 7
+                if wb == 7:
+                    continue
+                for at in range(new_off + 16, len(data) - 15, 16):
+                    nw = int.from_bytes(data[at:at + 16], 'little')
+                    if ((nw >> WAIT) & 63) >> wb & 1:
+                        nw &= ~(1 << (WAIT + wb))
+                        data[at:at + 16] = nw.to_bytes(16, 'little')
+                        changed = True
+                    if nw & nop_mask != nop_bits:
+                        break
+            section.data = bytes(data)
+        if not changed:
+            return None, ''
+        out = container.write()
+        if out == untouched[path]:
+            return None, ''
     elif out == untouched[path]:
         return None, ''
     if control != 'as it is':

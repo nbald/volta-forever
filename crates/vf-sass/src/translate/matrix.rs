@@ -14,7 +14,7 @@ use crate::rule;
 
 use super::context::{Ctx, apply_rule};
 use super::util::{late, put_operand_by_class};
-use super::{Item, Refused, SEQUENCE, with_stall};
+use super::{ARRIVES, Item, LATE_WRITER_KINDS, Refused, SEQUENCE, with_stall};
 
 // ---- Turing's matrix instructions -----------------------------------------------------------------------
 // Volta has neither. What stands for them is what the layer already does in program text
@@ -1120,31 +1120,59 @@ pub(super) fn translate_uniform_address(
 pub(super) fn translate_rule(ctx: &mut Ctx, i: usize, d: &Decoded, target: &str) -> Result<Vec<Item>, Refused> {
     let rule_idx =
         rule::find_rule(d.name, target, "").ok_or_else(|| Refused(format!("no rule from {} to {}", d.name, target)))?;
-    let out = apply_rule(ctx, rule_idx, i, d)?;
+    let mut out = apply_rule(ctx, rule_idx, i, d)?;
     let after = ctx.dec70.decode(out);
-    if let Some(ref after_d) = after
-        && after_d.kind.is_late()
-    {
-        let cls = &crate::generated::classes::VF_CLASSES[after_d.class_id as usize];
-        let reads = &crate::generated::classes::VF_READS[cls.12 as usize..(cls.12 + cls.13) as usize];
-        // Whether an operand of the result stands for a uniform operand of the instruction: the
-        // register that stands for it in the whole function, or the one it was loaded into from
-        // the frame for this instruction.
-        let from_uniform = |name_id: u16| {
-            let back = ordinary_back(OP_NAMES[name_id as usize], &d.ops);
-            back != name_id
-                && d.op(back)
-                    .is_some_and(|u| ctx.place.contains_key(&u) || ctx.mem_regs.contains_key(&u))
-        };
-        if reads
-            .iter()
-            .any(|&(letter, name_id, _)| letter == LETTER_R && after_d.has_op(name_id) && from_uniform(name_id))
-        {
-            // It reads a uniform register, and reads its operands late (`late`).
-            return Ok(vec![late(after_d.name, out, i, "ordinary registers")?]);
+    let mut await_write = false;
+    if let Some(ref after_d) = after {
+        if LATE_WRITER_KINDS.contains(&after_d.kind) && ((out >> WRITE_BARRIER) & 7) == 7 {
+            let writes_reg = after_d.writes.iter().any(|&(letter, r)| letter == LETTER_R && r != 255);
+            let writes_borrowed = ctx.borrow.as_ref().is_some_and(|b| {
+                after_d
+                    .writes
+                    .iter()
+                    .any(|&(letter, r)| letter == LETTER_R && r != 255 && b.used.contains(&r))
+            });
+            let upgraded_writer = !LATE_WRITER_KINDS.contains(&d.kind) && writes_reg;
+            if writes_borrowed || upgraded_writer {
+                // A rule target whose result arrives late (`MIO_FAST` / `MIO_SLOW`, such as `UFLO`
+                // -> `FLO` or `S2UR` -> `S2R`) must name a write scoreboard when writing a borrowed
+                // register or when translated from a fixed-latency instruction (`!LATE_WRITER_KINDS`,
+                // whose readers in the program wait on no scoreboard), before `late()` chooses the
+                // read scoreboard so the two barriers stay distinct (`read_announced`).
+                out = (out & !(7 << WRITE_BARRIER)) | (u128::from(ARRIVES) << WRITE_BARRIER);
+                await_write = upgraded_writer;
+            }
+        }
+        if after_d.kind.is_late() {
+            let cls = &crate::generated::classes::VF_CLASSES[after_d.class_id as usize];
+            let reads = &crate::generated::classes::VF_READS[cls.12 as usize..(cls.12 + cls.13) as usize];
+            // Whether an operand of the result stands for a uniform operand of the instruction: the
+            // register that stands for it in the whole function, or the one it was loaded into from
+            // the frame for this instruction.
+            let from_uniform = |name_id: u16| {
+                let back = ordinary_back(OP_NAMES[name_id as usize], &d.ops);
+                back != name_id
+                    && d.op(back)
+                        .is_some_and(|u| ctx.place.contains_key(&u) || ctx.mem_regs.contains_key(&u))
+            };
+            if reads
+                .iter()
+                .any(|&(letter, name_id, _)| letter == LETTER_R && after_d.has_op(name_id) && from_uniform(name_id))
+            {
+                // It reads a uniform register, and reads its operands late (`late`).
+                let mut item = late(after_d.name, out, i, "ordinary registers")?;
+                if await_write {
+                    item.also.push(ARRIVES);
+                }
+                return Ok(vec![item]);
+            }
         }
     }
-    Ok(vec![Item::new(out, i, "ordinary registers", true)])
+    let mut item = Item::new(out, i, "ordinary registers", true);
+    if await_write {
+        item.also.push(ARRIVES);
+    }
+    Ok(vec![item])
 }
 
 fn ordinary_back(operand: &str, ops: &[(u16, u32)]) -> u16 {

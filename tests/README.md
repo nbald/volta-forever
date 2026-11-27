@@ -85,7 +85,7 @@ Where the GPU scripts write:
 - `run.sh`: the test kernels, loaded as PTX and as machine code through the proxy (retargeting,
   translation, refusal, the cache, the second translation at launch, the CUDA runtime), give
   what the native sm_70 build of the same source, the host models or the reference vectors of
-  an RTX 5090 say. 233 cases (229 at 0.1.6, 200 at 0.1.5, 165 at 0.1.4), including nonconsecutive MMA fragments, a
+  an RTX 5090 say. 235 cases (229 at 0.1.6, 200 at 0.1.5, 165 at 0.1.4), including nonconsecutive MMA fragments, a
   partial warp reduction, a zero-filled asynchronous copy, sm_80 machine code translated, refused lookups
   (error 218 and a NULL handle, through a module, a library and the driver's linker), files of PTX,
   relocatable sm_75 machine code and a fat binary given to the driver's linker with `cuLinkAddFile`

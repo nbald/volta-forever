@@ -48,6 +48,8 @@ shf__RUR_RUR	shf__RRR_RRR	7624
 ubmsk__URURUR_URUR	bmsk__RRR_RRR	829
 uiadd3__URURUR_URURUR	iadd3_noimm__RRR_RRR	10452
 uiadd3__URsIUR_RIR	iadd3_imm__RsIR_RIR	12921
+uflo__URURUR_URURUR	flo__RRR_RRR	37
+uflo__URuIUR_URuIR	flo__RuIR_RIR	0
 uiadd3_x__URURUR_URURUR	iadd3_x_noimm__RRR_RRR	8328
 uiadd3_x__URsIUR_RIR	iadd3_x_imm__RIR_RIR	826
 uimad__URURUR_URURUR	imad__RRR_RRR	11635

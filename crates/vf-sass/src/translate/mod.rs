@@ -175,7 +175,7 @@ const AROUND: &[&str] = &[
 /// immediate (R_CUDA_ABS32_LO_32, R_CUDA_ABS32_HI_32).
 const HALVES: &[u32] = &[56, 57];
 /// The kinds whose results are written when they arrive (`docs/translator.md`, "Timing rules").
-const LATE_WRITER_KINDS: &[Kind] = &[Kind::MioFast, Kind::MioSlow];
+pub(super) const LATE_WRITER_KINDS: &[Kind] = &[Kind::MioFast, Kind::MioSlow];
 /// Fixed-time arithmetic whose result is written two cycles after the others'.
 const DEEP_WRITER_MNEMONICS: &[&str] = &["DADD", "DMUL", "DFMA", "HMMA"];
 
@@ -187,7 +187,7 @@ fn unannounced(d: &Decoded) -> bool {
 }
 
 /// The scoreboard on which a load added by the translation says its result is there.
-const ARRIVES: u32 = 4;
+pub(super) const ARRIVES: u32 = 4;
 /// The scoreboard of the instructions of a sequence that stands for a matrix instruction.
 const SEQUENCE: u32 = 5;
 /// The registers that the sequence of a matrix instruction computes into.

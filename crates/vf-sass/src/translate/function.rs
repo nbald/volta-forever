@@ -477,7 +477,7 @@ pub(super) fn translate_function(
                     16 * item.origin
                 )));
             }
-            if board != 7 && !written.is_disjoint(&item.borrows) {
+            if board != 7 && !written.is_disjoint(&item.borrows) && !item.also.contains(&board) {
                 // A result of the translation that is written when it arrives, in a register
                 // the program may write next: the next instruction waits until it is there.
                 item.also.push(board);

@@ -5013,6 +5013,33 @@ def main():
         pool_place_overlap = pool & set(whole.values())
         if pool_place_overlap:
             problems.append('%s: a register that the sequences compute into stands for a uniform one too: %s' % (name[:40], sorted(pool_place_overlap)))
+        # ---- late writer translated from a fixed-latency instruction ----
+        # When an instruction whose sm_75 form writes at fixed latency under no scoreboard
+        # (such as UFLO in UDP) becomes a late writer (MIO_FAST or MIO_SLOW, such as FLO), its
+        # readers in the original wait on no scoreboard, and Volta's MIO pipeline can take more
+        # cycles than any fixed stall (measured on a V100: stalls up to 15 fail). The result
+        # must name a write scoreboard and the next instruction must wait for it.
+        for new70, old75, what in listing:
+            if what != 'ordinary registers':
+                continue
+            w70 = int.from_bytes(result_code[new70:new70 + 16], 'little')
+            d70 = mc.decode(70, w70)
+            if d70 is None or d70.kind not in ('MIO_FAST', 'MIO_SLOW'):
+                continue
+            if not any(l == 'R' and r != 255 for l, r in d70.writes):
+                continue
+            i75 = old75 // 16
+            if i75 * 16 + 16 > len(original_code):
+                continue
+            w75 = int.from_bytes(original_code[old75:old75 + 16], 'little')
+            d75 = mc.decode(75, w75)
+            if d75 is None or d75.kind in ('MIO_FAST', 'MIO_SLOW') or (w75 >> WRITE_BARRIER) & 7 != 7:
+                continue
+            wb70 = (w70 >> WRITE_BARRIER) & 7
+            if wb70 == 7:
+                problems.append('%s+0x%x: late writer from non-late instruction writes without a write scoreboard: %s' % (name[:40], new70, tb[new70 // 16]))
+            elif not waited_after(result_code, new70, wb70)[0]:
+                problems.append('%s+0x%x: late writer from non-late instruction, next does not wait for scoreboard %d: %s' % (name[:40], new70, wb70, tb[new70 // 16]))
         # ---- rules for borrowed registers (1 through 6) ----
         # Declared borrowings from the .lives file: homes and pools.
         homes_declared = borrow_homes.get(name, [])        # [(UR, R, [offsets])]

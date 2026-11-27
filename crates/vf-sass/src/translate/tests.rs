@@ -1578,3 +1578,142 @@ fn a_result_of_double_precision_is_read_no_earlier_than_volta_reads_one() {
     let through = ends(&[with_stall(board(DSETP, 0), 2, false), nop, nop], &[32], true);
     assert_eq!(through[0] + through[1], 15, "{through:?}");
 }
+
+/// `UFLO` (`uflo__URURUR_URURUR` and `uflo__URuIUR_URuIR`, `UDP` on Turing) translates to Volta
+/// `FLO` (`MIO_FAST` on Volta): because `UFLO` had no write scoreboard on `sm_75`, every borrow
+/// mode (`0`, `1`, `8`) announces `WRITE_BARRIER = ARRIVES`, keeps `READ_BARRIER = 5` (distinct
+/// from `ARRIVES`), and waits on `ARRIVES` at the next instruction with `stall >= 2`.
+#[test]
+fn uflo_translates_and_announces_writes() {
+    let original = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/kernels/translate/k_uflo.sm75.cubin"
+    ));
+
+    let mut dec70 = Decoder::new(70);
+    for borrow in [0u32, 1u32, 8u32] {
+        let opts = Options {
+            borrow,
+            ..Options::default()
+        };
+        let res = translate_with_options(original, true, &opts).unwrap();
+        assert!(
+            res.report.iter().all(|f| f.refused.is_none()),
+            "borrow={borrow} refused: {:?}",
+            res.report
+        );
+        let elf_out = crate::elf::Elf::parse(&res.bytes).unwrap();
+        let map = res.map.unwrap();
+        let lives = res.lives.unwrap();
+        for (fname, origin) in [
+            ("k_uflo_u32", 0x50u64),
+            ("k_uflo_s32", 0x60u64),
+            ("k_uflo_s32", 0x70u64),
+            ("k_uflo_u32_sh", 0x60u64),
+        ] {
+            if borrow == 8 {
+                assert!(
+                    lives.iter().any(|(f, _, _, kind, _)| f == fname && *kind == "slot"),
+                    "expected level-3 slot in {fname} under borrow={borrow}"
+                );
+            }
+            let code = &elf_out.sections[elf_out.section(&format!(".text.{fname}")).unwrap()].data;
+            let (_, new, _, _) = map
+                .iter()
+                .find(|(f, _, old, what)| f == fname && *old == origin && what == "ordinary registers")
+                .unwrap();
+            let at = *new as usize;
+            let w = u128::from_le_bytes(code[at..at + 16].try_into().unwrap());
+            let d = dec70.decode(w).unwrap();
+            assert_eq!(d.name, "flo__RRR_RRR", "borrow={borrow} {fname}@0x{origin:x}");
+            assert_eq!(
+                (w >> WRITE_BARRIER) & 7,
+                u128::from(ARRIVES),
+                "missing ARRIVES write barrier at borrow={borrow} {fname}@0x{origin:x}"
+            );
+            assert_eq!(
+                (w >> READ_BARRIER) & 7,
+                5,
+                "expected READ_BARRIER=5 distinct from ARRIVES at borrow={borrow} {fname}@0x{origin:x}"
+            );
+            assert!(
+                stall_of(w) >= 2,
+                "expected stall >= 2 before next wait on ARRIVES at borrow={borrow} {fname}@0x{origin:x}"
+            );
+            let next = u128::from_le_bytes(code[at + 16..at + 32].try_into().unwrap());
+            assert_ne!(
+                ((next >> WAIT) & 63) & (1u128 << ARRIVES),
+                0,
+                "next instruction must wait on ARRIVES at borrow={borrow} {fname}@0x{origin:x}"
+            );
+        }
+    }
+}
+
+/// Immediate (`uflo__URuIUR_URuIR`) and `URZ` (`uflo__URURUR_URURUR`) inputs do not read a
+/// uniform register stand-in, so `READ_BARRIER` stays `7`, while a real register destination (`Rd !=
+/// RZ`) still gets `WRITE_BARRIER = ARRIVES` and a wait on the next instruction at every borrow
+/// mode; writing to `URZ` (`Rd = RZ`) writes no register and keeps `WRITE_BARRIER = 7`.
+#[test]
+fn uflo_imm_and_urz_forms_announce_write_without_read_barrier() {
+    let template = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/kernels/translate/k_uflo.sm75.cubin"
+    ));
+    let mut dec70 = Decoder::new(70);
+    let orig_word = 0x000fc800080e0000_00000004000472bd_u128;
+    let imm_word = 0x000fc400080e0000_12345678000478bd_u128;
+    let urz_word = 0x000fc400080e0000_0000003f000472bd_u128;
+    let urz_dest_word = (urz_word & !(0x3fu128 << 16)) | (0x3fu128 << 16);
+    for (label, replacement, expected_class, expected_wb) in [
+        ("uImm", imm_word, "flo__RuIR_RIR", u128::from(ARRIVES)),
+        ("URZ", urz_word, "flo__RRR_RRR", u128::from(ARRIVES)),
+        ("URd=URZ", urz_dest_word, "flo__RRR_RRR", 7u128),
+    ] {
+        let mut input = crate::elf::Elf::parse(template).unwrap();
+        let sec = input.section(".text.k_uflo_u32").unwrap();
+        let bytes = &mut input.sections[sec].data;
+        assert_eq!(&bytes[0x50..0x60], &orig_word.to_le_bytes());
+        bytes[0x50..0x60].copy_from_slice(&replacement.to_le_bytes());
+        let modified = input.write();
+
+        for borrow in [0u32, 8u32] {
+            let res = translate_with_options(
+                &modified,
+                true,
+                &Options {
+                    borrow,
+                    ..Options::default()
+                },
+            )
+            .unwrap();
+            assert!(
+                res.report.iter().all(|f| f.refused.is_none()),
+                "{label} borrow={borrow}: {:?}",
+                res.report
+            );
+            let eo = crate::elf::Elf::parse(&res.bytes).unwrap();
+            let co = &eo.sections[eo.section(".text.k_uflo_u32").unwrap()].data;
+            let (_, new, _, _) = res
+                .map
+                .unwrap()
+                .into_iter()
+                .find(|(f, _, o, _)| f == "k_uflo_u32" && *o == 0x50)
+                .unwrap();
+            let at = new as usize;
+            let w = u128::from_le_bytes(co[at..at + 16].try_into().unwrap());
+            assert_eq!(dec70.decode(w).unwrap().name, expected_class);
+            assert_eq!((w >> WRITE_BARRIER) & 7, expected_wb, "{label} borrow={borrow} wb");
+            assert_eq!((w >> READ_BARRIER) & 7, 7, "{label} borrow={borrow} rb");
+            if expected_wb != 7 {
+                assert!(stall_of(w) >= 2, "{label} borrow={borrow} stall");
+                let next = u128::from_le_bytes(co[at + 16..at + 32].try_into().unwrap());
+                assert_ne!(
+                    ((next >> WAIT) & 63) & (1u128 << ARRIVES),
+                    0,
+                    "{label} borrow={borrow} next wait"
+                );
+            }
+        }
+    }
+}

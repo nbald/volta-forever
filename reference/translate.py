@@ -1039,7 +1039,7 @@ class Function:
                     # part of a sequence whose later instruction says when the result is there,
                     # and what follows waits for it: the late arrival is handled.)
                     raise Refused('a borrowed register receives at 0x%x a result that nothing announces' % (16 * item.origin))
-                if board != 7 and written.intersection(item.borrows):
+                if board != 7 and written.intersection(item.borrows) and board not in item.also:
                     # A result of the translation that is written when it arrives, in a register
                     # the program may write next (where nothing reads it on some way, it would
                     # arrive over what the program wrote): the next instruction waits until it
@@ -1613,18 +1613,34 @@ class Function:
         if name in mc.rule_of:
             out = self.rule(d, mc.rule_of[name], i)
             after = mc.decode(70, out)
-            def uniform(operand):
-                # Whether `operand` of the result stands for a uniform operand of the instruction:
-                # the register that stands for it in the whole function, or the one it was loaded
-                # into from the frame for this instruction.
-                back = ordinary_back(operand, ops)
-                return back != operand and (ops.get(back) in self.place or ops.get(back) in self._mem_regs)
-            if after is not None and after.kind in MC.LATE and any(
-                    letter == 'R' and operand in after.ops and uniform(operand)
-                    for letter, operand, span in mc._uses[(70, after.c.name)].reads):
-                # It reads a uniform register, and reads its operands late (`late`).
-                return [self.late(after.c, out, i, 'ordinary registers')]
-            return [Item(out, i, 'ordinary registers')]
+            await_write = False
+            if after is not None:
+                if after.kind in LATE_WRITERS and (out >> WRITE_BARRIER) & 7 == 7:
+                    writes_reg = any(l == 'R' and r != 255 for l, r in after.writes)
+                    writes_borrowed = self.borrow is not None and any(
+                        l == 'R' and r != 255 and r in self.borrow.used for l, r in after.writes)
+                    upgraded_writer = d.kind not in LATE_WRITERS and writes_reg
+                    if writes_borrowed or upgraded_writer:
+                        out = (out & ~(7 << WRITE_BARRIER)) | (ARRIVES << WRITE_BARRIER)
+                        await_write = upgraded_writer
+                def uniform(operand):
+                    # Whether `operand` of the result stands for a uniform operand of the instruction:
+                    # the register that stands for it in the whole function, or the one it was loaded
+                    # into from the frame for this instruction.
+                    back = ordinary_back(operand, ops)
+                    return back != operand and (ops.get(back) in self.place or ops.get(back) in self._mem_regs)
+                if after.kind in MC.LATE and any(
+                        letter == 'R' and operand in after.ops and uniform(operand)
+                        for letter, operand, span in mc._uses[(70, after.c.name)].reads):
+                    # It reads a uniform register, and reads its operands late (`late`).
+                    item = self.late(after.c, out, i, 'ordinary registers')
+                    if await_write:
+                        item.also.append(ARRIVES)
+                    return [item]
+            item = Item(out, i, 'ordinary registers')
+            if await_write:
+                item.also.append(ARRIVES)
+            return [item]
         raise Refused('no translation for %s (%s) at 0x%x' % (d.c.name, d.mnemonic, 16 * i))
 
     # ---- Turing's matrix instructions ---------------------------------------------------------------------------

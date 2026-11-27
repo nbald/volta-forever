@@ -153,6 +153,14 @@ mod tests {
             (0x000fc8000f8ffa3f_8000000806069291, 0x000fc800078ffaff_8000006c6a6a9211),
             // @P3 LEA.HI R0, R2, -UR14, R7, 0x1c -> @P3 LEA.HI R0, R2, -R114, R7, 0x1c
             (0x000fe4000f8fe007_8000000e02003c11, 0x000fe400078fe007_8000007202003211),
+            // UFLO.U32 UR5, UR4 -> FLO.U32 R105, R104
+            (0x000fc400080e0000_00000004000572bd, 0x000fc400000e0000_0000006800697300),
+            // @!UP2 UFLO.SH UR6, ~UR4 -> @!P2 FLO.SH R106, ~R104
+            (0x000fc400080e0600_800000040006a2bd, 0x000fc400000e0600_80000068006aa300),
+            // UFLO.U32 URZ, URZ -> FLO.U32 RZ, RZ
+            (0x000fc400080e0000_0000003f003f72bd, 0x000fc400000e0000_000000ff00ff7300),
+            // UFLO.U32.SH UR5, 0x12345678 -> FLO.U32.SH R105, 0x12345678
+            (0x000fc400080e0400_12345678000578bd, 0x000fc400000e0400_1234567800697900),
         ];
         let mut decoder = Decoder::new(75);
         for (source, expected) in cases {

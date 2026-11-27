@@ -173,6 +173,9 @@ each as nvdisasm reads it on both sides, are the unit test
 through the whole translator and runs on a V100, and a `UIMAD.X` and a
 `UIMAD.WIDE.X` put into test kernels go through the whole translator
 (`crates/vf-sass/src/translate/tests.rs`).
+Uniform find-leading-one instructions (`uflo__URURUR_URURUR` and `uflo__URuIUR_URuIR`,
+with register or 32-bit uniform immediate source) map to Volta `FLO` (`flo__RRR_RRR` and
+`flo__RuIR_RIR`, verified against nvdisasm in `crates/vf-sass/src/rule.rs`).
 
 An instruction with a uniform operand (a load at `[R4 + UR6 + 0x10]`, a
 comparison against UR2) is rewritten to the sm_70 form with an ordinary
@@ -865,6 +868,18 @@ no scoreboard, or by arithmetic on doubles, or by a matrix product, is never
 borrowed: nothing can be waited for, and the distance across a branch is not
 known. On PyTorch, 161 homes fewer of 12,109 (`reference/translate.py`,
 `unannounced`).
+
+Conversely, a late-writing instruction produced by a rule (`MIO_FAST` or `MIO_SLOW`, such
+as `FLO` from `UFLO` or `S2R` from `S2UR`) that writes a borrowed register or translates from
+a fixed-latency instruction under no scoreboard (`!LATE_WRITER_KINDS` with `WRITE_BARRIER = 7`,
+such as `UFLO` in `UDP` becoming `FLO` in `MIO_FAST` while writing a non-`RZ` register) names
+`dst_wr_sb = ARRIVES` before `late()` chooses a read scoreboard (keeping the two barriers
+distinct). Because readers of a fixed-latency `sm_75` instruction wait on no scoreboard and
+Volta's shared MIO pipeline can exceed a fixed stall under contention (measured on a V100:
+stalls up to 15 still corrupted results), an upgraded writer from `!LATE_WRITER_KINDS` also
+makes the following instruction wait on `ARRIVES` at a stall of at least two cycles across
+every borrow mode (`crates/vf-sass/src/translate/matrix.rs::translate_rule`,
+`reference/translate.py`).
 
 
 ### Predicates written late

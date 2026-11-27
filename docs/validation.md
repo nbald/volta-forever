@@ -266,7 +266,8 @@ with the next instruction waiting, and the distances between the steps and after
   objected to in neither, which an objection of a check of the whole function to the translation
   as it is had hidden.) Here and wherever a rule asks the next instruction to wait (after a load from the
   frame or a store to it, after a register put away or brought back, after a late write to a
-  borrowed register), instructions that do nothing may stand between: the schedule puts some
+  borrowed register, and after a late writer translated by a rule from a fixed-latency
+  instruction under no scoreboard such as `UFLO` -> `FLO`), instructions that do nothing may stand between: the schedule puts some
   where it needs more time than a stall holds, a wait holds for everything after it, and an
   instruction that does nothing reads and writes no register.
 - A predicate given back from a register of the translation comes nine cycles or more after the
@@ -315,7 +316,7 @@ with the next instruction waiting, and the distances between the steps and after
 ## 3. Controls
 
 A check that never objects proves nothing. `reference/controls.py` makes the reference translator
-wrong on purpose, one way at a time, and counts what the validator finds in the result: 117
+wrong on purpose, one way at a time, and counts what the validator finds in the result: 119
 controls, each described at the head of that file. A control that changes translations and meets
 no objection anywhere is a hole in the validator, or a control that tests nothing.
 
@@ -367,7 +368,7 @@ many cubins the control changed the translation and in how many of those the val
 (`summary.tsv` of the run has the first objection to each, which is not always the one the
 control was written for: a fault often breaks more than one rule.)
 
-**The map, predicates, waits, matrix sequences (34)**
+**The map, predicates, waits, matrix sequences (35)**
 
 | Control | What is made wrong | Objected to (cubins objected to, of those it changes) |
 |---|---|---|
@@ -376,6 +377,7 @@ control was written for: a fault often breaks more than one rule.)
 | `cut` | The lives of a uniform predicate are cut at every instruction: what one instruction writes, the next reads in what may be another predicate | default: 25 of 25 |
 | `masks` | The P2R and R2P of the program are taken to read and write no predicate (the predicates are a mask, a number: the tables do not say which) | default: 2 of 2 |
 | `nowait` | The instruction after one that reads late a register of the translation does not wait for it | default: 30 of 30 |
+| `late_rule_nowait` | A late writer (`MIO_FAST` or `MIO_SLOW`) translated from a non-late instruction under no scoreboard (`UFLO` -> `FLO`) does not wait for its write scoreboard after the instruction | default: 1 of 1 (checked-in cubins) |
 | `close` | A wait comes one cycle after the instruction that names its scoreboard | default: 35 of 35 |
 | `returns` | A number that makes a return address is off by one instruction | default: 22 of 22 |
 | `waitless` | What an instruction waited for, the first instruction of what it became does not wait for (ULDC lost its wait that way until a review found it) | default: 35 of 35 |
@@ -425,7 +427,7 @@ control was written for: a fault often breaks more than one rule.)
 | `unconverted` | The conversions of the first place that has some are left out: every sequence is as the design has it, and the plan is wrong (the checker of plans, qcheck.py, must object: nothing else looks at the states of the accumulators) | default: 5 of 5 |
 | `notalso` | A load whose result in Turing's layout something else reads does not give it (the same: only the checker of plans knows who reads what) | default: 5 of 5 |
 
-**Borrowed registers (9)**
+**Borrowed registers (10)**
 
 | Control | What is made wrong | Objected to (cubins objected to, of those it changes) |
 |---|---|---|
@@ -433,6 +435,7 @@ control was written for: a fault often breaks more than one rule.)
 | `alive_home` | The home of each uniform register is the register after the one chosen | default: 2 of 2; `VF_BORROW=1`: 17 of 20 |
 | `no_borrow_wait` | Where the first instruction of what an instruction became waits for the six scoreboards, it waits for what the original waited for only | default: 9 of 9; `VF_BORROW=1`: 26 of 28 |
 | `no_late_borrow` | An instruction of the program that reads a borrowed register late does not say when it has read | default: 9 of 9; `VF_BORROW=1`: 20 of 20 |
+| `late_writer` | A late writer (`MIO_FAST` or `MIO_SLOW`) of the translation that writes a borrowed register does not say when it writes (2026-11-27) | default: 1 of 1; `VF_BORROW=1`: 8 of 8 (checked-in cubins) |
 | `written_pair` | The pair given at an instruction is one that the original instruction writes | default: 1 of 1; `VF_BORROW=1`: 9 of 10 |
 | `shared_home` | What the homes take is forgotten once they are chosen: a register given at an instruction may be the home of a uniform register that is alive there | default: 2 of 2; `VF_BORROW=1`: 6 of 6 |
 | `overlap_pool` | The same for the pairs only | default: 1 of 1; `VF_BORROW=1`: 5 of 5 |
@@ -745,10 +748,10 @@ layer, and each kernel must give what the sm_70 build gives on the same inputs. 
 is compared with itself first: a kernel whose result depends on the order of its threads would
 fail there, and would prove nothing.
 
-Twelve source files, 62 kernels: all the same as their native builds. They cover uniform
+Thirteen source files, 65 kernels: all the same as their native builds. They cover uniform
 registers and predicates, calls, loops, minima and maxima, jump tables, memory instructions,
-conversions, instructions on uniform registers under a guard, and `UIMAD` with an immediate and
-`UIMAD.WIDE` (`k_uimad.cu`, since pull request #15), one kind of rewriting each.
+conversions, instructions on uniform registers under a guard, and `UIMAD` with an immediate,
+`UIMAD.WIDE` (`k_uimad.cu`, since pull request #15), and `UFLO` (`k_uflo.cu`), one kind of rewriting each.
 
 Two of the files run a second time from a cubin changed by hand into something that compilers
 do not write, or write rarely, and that a translation must still get right:
