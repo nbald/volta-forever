@@ -384,14 +384,27 @@ A call gives its callee a return address as an immediate: `MOV R26, 0x180`
 before `CALL.REL`, or `LEPC` (read the program counter) with two immediates
 added to it before an indirect call. When the translator inserts or removes
 instructions, those numbers must follow. The translator finds them by their
-structure (the `MOV` whose value matches the return point and whose register
-reaches the call; the two terms of the `LEPC` addition), and refuses the
-function when it cannot.
+structure (every `MOV` whose immediate matches the return point and whose
+register reaches the call along all paths of the function's control-flow graph;
+the two terms of the `LEPC` addition), and refuses the function when it cannot.
 
-Of PyTorch's cubins: every relative call (`CALL.REL`) has a `MOV` with the
-return address before it, and every indirect call has its `LEPC` immediates in
-one of two recognized arrangements. Four functions are refused for a return
-address that is not given the usual way.
+For relative calls (`CALL.REL`), both translators (`crates/vf-sass/src/translate/return_addr.rs`
+and `return_addresses` in `reference/translate.py`) track `MOV` definitions
+across branches and convergence barriers (`BSSY`/`BREAK` edges keyed by barrier
+register, with matched `room` save/restore spans transparent), follow the
+callee's `RET.REL` register back through register copies and nested calls, and
+verify that no instruction reads the register as data before, inside, or after
+the call when preserved across it. That lets every reaching return-address `MOV`
+follow across branches and barriers while leaving colliding data constants alone,
+and refuses if any incoming path lacks a matching `MOV`, is predicated, or mixes
+data reads with the return address (`k_call_rel_mov.cu` and unit tests in
+`crates/vf-sass/src/translate/tests.rs`).
+
+Of PyTorch's cubins: indirect calls have their `LEPC` immediates in one of two
+recognized arrangements, and the relative-call `CALL.REL` cases across branches,
+barriers, and colliding data constants (`0266.sm_75.cubin`, `0316.sm_75.cubin`,
+`0393.sm_75.cubin`, sixteen functions once refused) now translate cleanly
+(section 8 keeps the 0.1.3 counts).
 
 A branch through a register (`BRX`) is a jump table. The container lists its
 targets; the translator adjusts each target offset. Two functions of PyTorch are

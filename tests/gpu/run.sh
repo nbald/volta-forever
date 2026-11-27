@@ -473,6 +473,7 @@ mc k_uniform 4
 mc k_params 3
 mc k_uniform_math 2
 mc k_uimad 2
+mc k_call_rel_mov 2
 mc k_switch 12
 mc k_memory 7
 mc k_convert 2

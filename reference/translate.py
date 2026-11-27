@@ -2334,23 +2334,297 @@ class Function:
     # ---- return addresses ----------------------------------------------------------------------------------
     def return_addresses(self):
         """A callee is told where to return by a number: the offset of the instruction after the call,
-        put in a register by a MOV before the call. When the code moves, so must that number. The MOV
-        is found by what it does, and a function in which it is not found exactly is refused."""
+        put in a register by a MOV before the call. When the code moves, so must that number. Each
+        CALL.REL is resolved across the control-flow graph against the callee's RET.REL register(s),
+        verifying that every reaching definition is a clean MOV of the return address and that the
+        register is not read as data on any path that still holds it."""
         mc, items = self.mc, self.items
         def immediate(item):
             d = item.d
-            if d.c.name == 'mov__RuIR_RI' or (d.mnemonic == 'MOV' and 'Sb' in d.ops and 'Rb' not in d.ops and 'Sb_bank' not in d.ops):
+            if d.c.name == 'mov__RuIR_RI' or (
+                d.mnemonic == 'MOV' and 'Sb' in d.ops and 'Rb' not in d.ops and 'Sb_bank' not in d.ops
+                and d.ops.get('PixMaskU04', 15) == 15
+            ):
                 return d.ops['Sb']
             return None
-        movs = collections.defaultdict(list)
-        for k, item in enumerate(items):
-            v = immediate(item)
-            if v is not None:
-                movs[v].append(k)
-        first_of = {}
-        for k, item in enumerate(items):
-            if item.first:
-                first_of[16 * item.origin] = k
+        def unguarded(d):
+            ops = d.ops
+            return (ops.get('Pg', 7) == 7 and not ops.get('Pg@not', 0)
+                    and ops.get('UPg', 7) == 7 and not ops.get('UPg@not', 0))
+        def copy_src(d):
+            if not unguarded(d):
+                return None
+            n = d.c.name
+            ops = d.ops
+            r_writes = [r for l, r in d.writes if l == 'R' and r < 255]
+            if len(r_writes) != 1:
+                return None
+            if n == 'mov__RRR_RR' and ops.get('PixMaskU04', 15) == 15:
+                rb = ops.get('Rb', 255)
+                if rb != 255 and ops['Rd'] == r_writes[0]:
+                    return ops['Rd'], rb
+            elif n == 'imad__RRR_RRR' and ops.get('Ra', 255) == 255 and ops.get('Rb', 255) == 255 and not ops.get('Rc@negate', 0) and not ops.get('X', 0):
+                rc = ops.get('Rc', 255)
+                if rc != 255 and ops['Rd'] == r_writes[0]:
+                    return ops['Rd'], rc
+            return None
+        def compute_room_regs():
+            room_regs = [set() for _ in items]
+            i = 0
+            n = len(items)
+            while i < n:
+                orig = items[i].origin
+                end = i + 1
+                while end < n and items[end].origin == orig:
+                    end += 1
+                away_idx, back_idx = {}, {}
+                for x in range(i, end):
+                    w = items[x].what
+                    if w.startswith('room: R') and w.endswith(' away'):
+                        away_idx.setdefault(int(w[7:-5]), x)
+                    elif w.startswith('room: R') and w.endswith(' back'):
+                        back_idx[int(w[7:-5])] = x
+                for r, ia in away_idx.items():
+                    ib = back_idx.get(r)
+                    if ib is not None and ia < ib:
+                        for x in range(ia, ib + 1):
+                            room_regs[x].add(r)
+                i = end
+            return room_regs
+        def build_cfg():
+            n = len(items)
+            first_at = {16 * it.origin: idx for idx, it in enumerate(items) if it.first}
+            LEAVES = ('BREAK', 'BRK', 'CONT', 'PEXIT', 'PRET', 'PLONGJMP', 'LONGJMP')
+            base_succ = [[] for _ in range(n)]
+            leaves = []
+            meets = set()
+            bssy_at = {}
+            for i, it in enumerate(items):
+                d = it.d
+                m = d.mnemonic
+                ug = unguarded(d)
+                after = [i + 1] if i + 1 < n else []
+                if m in ('EXIT', 'RET'):
+                    base_succ[i] = [] if ug else after
+                elif d.c.name == 'brx_' and (16 * it.origin) in self.tables:
+                    tgts = [first_at[t] for t in self.tables[16 * it.origin] if t in first_at]
+                    base_succ[i] = ([] if ug else after) + tgts
+                elif m == 'BRA':
+                    ops = d.ops
+                    always = ug and ops.get('Pp', 7) == 7 and not ops.get('Pp@not', 0) and not ops.get('cond', 0)
+                    t = first_at.get(it.target) if it.target is not None else None
+                    base_succ[i] = ([t] if t is not None else []) if always else (after + ([t] if t is not None else []))
+                elif m in ('BSSY', 'PBK', 'SSY', 'PCNT'):
+                    base_succ[i] = after
+                    t = first_at.get(it.target) if it.target is not None else None
+                    if t is not None:
+                        meets.add(t)
+                        b = d.ops.get('barReg') if m == 'BSSY' else None
+                        bssy_at[i] = (b, t, ug)
+                elif m in LEAVES:
+                    base_succ[i] = after
+                    leaves.append(i)
+                elif d.c.name.startswith(('call', 'jcal')):
+                    base_succ[i] = after
+                elif it.target is not None and m not in ('BRX', 'JMX', 'JMP'):
+                    t = first_at.get(it.target)
+                    base_succ[i] = after + ([t] if t is not None else [])
+                else:
+                    base_succ[i] = after
+            succ = [list(s) for s in base_succ]
+            has_bmov_restore = any(
+                it.d.mnemonic == 'BMOV' and not it.d.ops.get('clear', 0) and any(l == 'B' for l, _ in it.d.writes)
+                for it in items
+            )
+            if leaves and meets:
+                in_act = [collections.defaultdict(set) for _ in range(n)]
+                q = collections.deque(sorted(bssy_at.keys()))
+                in_q = set(bssy_at.keys())
+                while q:
+                    i = q.popleft()
+                    in_q.remove(i)
+                    out = {b: set(ts) for b, ts in in_act[i].items()}
+                    d = items[i].d
+                    if i in bssy_at:
+                        b, t, ug = bssy_at[i]
+                        if ug and b is not None:
+                            out[b] = {t}
+                        else:
+                            out.setdefault(b, set()).add(t)
+                    if d.mnemonic in LEAVES:
+                        b = d.ops.get('barReg') if d.mnemonic == 'BREAK' else None
+                        tgts = sorted(in_act[i].get(b, ())) if b is not None else sorted(meets)
+                        if b is not None and not tgts and has_bmov_restore:
+                            tgts = sorted(meets)
+                        succ[i] = base_succ[i] + [t for t in tgts if t not in base_succ[i]]
+                    for nxt in succ[i]:
+                        changed = False
+                        for b, ts in out.items():
+                            if not ts.issubset(in_act[nxt][b]):
+                                in_act[nxt][b] |= ts
+                                changed = True
+                        if changed and nxt not in in_q:
+                            q.append(nxt)
+                            in_q.add(nxt)
+            preds = [[] for _ in range(n)]
+            for i in range(n):
+                for j in succ[i]:
+                    preds[j].append(i)
+            return first_at, succ, preds
+        cfg_state = None
+        callee_cache = {}
+        def get_cfg():
+            nonlocal cfg_state
+            if cfg_state is None:
+                first_at, succ, preds = build_cfg()
+                room_regs = compute_room_regs()
+                cfg_state = (first_at, succ, preds, room_regs)
+            return cfg_state
+        def analyze_callee(entry_idx, stack):
+            if entry_idx in callee_cache:
+                return callee_cache[entry_idx]
+            if entry_idx in stack:
+                return None
+            stack = stack | {entry_idx}
+            first_at, succ, _, room_regs = get_cfg()
+            body = set()
+            w = [entry_idx]
+            nested_calls = []
+            rets = []
+            while w:
+                x = w.pop()
+                if x in body:
+                    continue
+                body.add(x)
+                dx = items[x].d
+                if dx.mnemonic == 'RET':
+                    rets.append(x)
+                elif dx.c.name.startswith('call_rel'):
+                    t = first_at.get(items[x].target) if items[x].target is not None else None
+                    if t is None:
+                        callee_cache[entry_idx] = None
+                        return None
+                    nested_calls.append((x, t))
+                elif dx.c.name.startswith(('call', 'jcal')) or dx.mnemonic in ('BRX', 'JMX', 'JMP'):
+                    if dx.c.name != 'brx_':
+                        callee_cache[entry_idx] = None
+                        return None
+                for nxt in succ[x]:
+                    if nxt not in body:
+                        w.append(nxt)
+            if not rets:
+                callee_cache[entry_idx] = None
+                return None
+            for rx in rets:
+                if items[rx].d.c.name != 'ret__REL' or items[rx].target != 0:
+                    callee_cache[entry_idx] = None
+                    return None
+            nested_info = {}
+            for cx, ct in nested_calls:
+                res = analyze_callee(ct, stack)
+                if res is None:
+                    if ct not in stack:
+                        callee_cache[entry_idx] = None
+                    return None
+                nested_info[cx] = res
+            CLOB = -2
+            in_st = {entry_idx: list(range(255))}
+            in_must = {entry_idx: set()}
+            q = collections.deque([entry_idx])
+            in_q = {entry_idx}
+            may_write = set()
+            while q:
+                x = q.popleft()
+                in_q.remove(x)
+                st = list(in_st[x])
+                mw = set(in_must[x])
+                dx = items[x].d
+                rr = room_regs[x]
+                ug = unguarded(dx)
+                cp = copy_src(dx)
+                if cp is not None:
+                    rd, rs = cp
+                    if rd < 255 and rd not in rr:
+                        may_write.add(rd)
+                        old_v = st[rs] if (rs < 255 and rs not in rr) else CLOB
+                        st[rd] = old_v
+                        if old_v != rd:
+                            mw.add(rd)
+                elif dx.c.name.startswith('call_rel'):
+                    _, n_may, n_must, _ = nested_info[x]
+                    may_write |= (n_may - rr)
+                    for r in n_may:
+                        if r < 255 and r not in rr:
+                            st[r] = CLOB
+                    if ug:
+                        mw |= (n_must - rr)
+                else:
+                    for l, r in dx.writes:
+                        if l == 'R' and r < 255 and r not in rr:
+                            may_write.add(r)
+                            st[r] = CLOB
+                            if ug:
+                                mw.add(r)
+                for nxt in succ[x]:
+                    if nxt not in body:
+                        continue
+                    if nxt not in in_st:
+                        in_st[nxt] = st
+                        in_must[nxt] = mw
+                        q.append(nxt)
+                        in_q.add(nxt)
+                    else:
+                        cur = in_st[nxt]
+                        changed = False
+                        for r in range(255):
+                            if cur[r] != st[r] and cur[r] != CLOB:
+                                cur[r] = CLOB
+                                changed = True
+                        new_m = in_must[nxt] & mw
+                        if new_m != in_must[nxt]:
+                            in_must[nxt] = new_m
+                            changed = True
+                        if changed and nxt not in in_q:
+                            q.append(nxt)
+                            in_q.add(nxt)
+            ret_inputs = set()
+            must_write = set(range(255))
+            for rx in rets:
+                if rx not in in_st:
+                    callee_cache[entry_idx] = None
+                    return None
+                ra = items[rx].d.ops['Ra']
+                v = in_st[rx][ra] if ra < 255 else CLOB
+                if v < 0:
+                    callee_cache[entry_idx] = None
+                    return None
+                ret_inputs.add(v)
+                must_write &= in_must[rx]
+            if len(ret_inputs) != 1:
+                callee_cache[entry_idx] = None
+                return None
+            ret_reg = next(iter(ret_inputs))
+            data_read_inputs = set()
+            for x in body:
+                dx = items[x].d
+                rr = room_regs[x]
+                if dx.mnemonic == 'RET' or copy_src(dx) is not None:
+                    continue
+                if dx.c.name.startswith('call_rel'):
+                    _, _, _, n_reads = nested_info[x]
+                    for nr in n_reads:
+                        if nr < 255 and nr not in rr and in_st[x][nr] >= 0:
+                            data_read_inputs.add(in_st[x][nr])
+                    continue
+                for l, r, _ in dx.reads:
+                    if l == 'R' and r < 255 and r not in rr and in_st[x][r] >= 0:
+                        data_read_inputs.add(in_st[x][r])
+            if ret_reg in data_read_inputs:
+                callee_cache[entry_idx] = None
+                return None
+            res = (ret_reg, may_write, must_write, data_read_inputs)
+            callee_cache[entry_idx] = res
+            return res
         for k, item in enumerate(items):
             name = item.d.c.name
             if name == 'brx_' and 16 * item.origin in self.tables:
@@ -2367,16 +2641,105 @@ class Function:
             elif name.startswith('call_rel') or name.startswith('jmp') or item.d.mnemonic in ('BRX', 'JMX', 'JMP'):
                 if not name.startswith('call_rel'):
                     raise Refused('%s at 0x%x: a jump that is not understood' % (item.d.mnemonic, 16 * item.origin))
+                first_at, succ, preds, room_regs = get_cfg()
+                t = first_at.get(item.target) if item.target is not None else None
+                callee = analyze_callee(t, set()) if t is not None else None
+                if callee is None:
+                    raise Refused('the callee of the call at 0x%x does not take its return address in one register' % (16 * item.origin))
+                ret_reg, _, must_write, _ = callee
                 back = 16 * item.origin + 16
-                found = [j for j in movs.get(back, [])]
-                if len(found) != 1 or found[0] > k:
-                    raise Refused('the return address of the call at 0x%x is not given by exactly one MOV' % (16 * item.origin))
-                j = found[0]
-                register = items[j].d.ops['Rd']
-                for between in items[j + 1:k]:
-                    if ('R', register) in between.d.writes or (between.first and 16 * between.origin in self.targets) or between.d.kind == 'BRU':
-                        raise Refused('the return address of the call at 0x%x does not reach it in a straight line' % (16 * item.origin))
-                items[j].fix = back
+                if not preds[k]:
+                    raise Refused('the return address of the call at 0x%x does not reach it on every path' % (16 * item.origin))
+                vis = set()
+                w = list(preds[k])
+                defs = set()
+                while w:
+                    p = w.pop()
+                    if p in vis:
+                        continue
+                    vis.add(p)
+                    itp = items[p]
+                    dp = itp.d
+                    if ret_reg in room_regs[p]:
+                        if not preds[p]:
+                            raise Refused('the return address of the call at 0x%x does not reach it on every path' % (16 * item.origin))
+                        w.extend(preds[p])
+                        continue
+                    if dp.c.name.startswith('call_rel'):
+                        pt = first_at.get(itp.target) if itp.target is not None else None
+                        pres = analyze_callee(pt, set()) if pt is not None else None
+                        if pres is None or ret_reg in pres[1] or not preds[p]:
+                            raise Refused('the return address of the call at 0x%x does not reach it on every path' % (16 * item.origin))
+                        w.extend(preds[p])
+                        continue
+                    if dp.c.name.startswith(('call', 'jcal')):
+                        raise Refused('the return address of the call at 0x%x does not reach it on every path' % (16 * item.origin))
+                    if any(l == 'R' and r == ret_reg for l, r in dp.writes):
+                        if unguarded(dp) and immediate(itp) == back:
+                            defs.add(p)
+                        else:
+                            raise Refused('the return address of the call at 0x%x does not reach it on every path' % (16 * item.origin))
+                    else:
+                        if not preds[p]:
+                            raise Refused('the return address of the call at 0x%x does not reach it on every path' % (16 * item.origin))
+                        w.extend(preds[p])
+                if not defs:
+                    raise Refused('the return address of the call at 0x%x does not reach it on every path' % (16 * item.origin))
+                f_vis = set()
+                fw = [s for j in defs for s in succ[j]]
+                while fw:
+                    x = fw.pop()
+                    if x in f_vis or x == k:
+                        continue
+                    f_vis.add(x)
+                    itx = items[x]
+                    dx = itx.d
+                    if ret_reg in room_regs[x]:
+                        fw.extend(succ[x])
+                        continue
+                    if any(l == 'R' and r == ret_reg for l, r, _ in dx.reads):
+                        raise Refused('the return address of the call at 0x%x is read as data' % (16 * item.origin))
+                    if dx.c.name.startswith('call_rel'):
+                        pt = first_at.get(itx.target) if itx.target is not None else None
+                        pres = analyze_callee(pt, set()) if pt is not None else None
+                        if pres is None or pres[0] == ret_reg or ret_reg in pres[3]:
+                            raise Refused('the return address of the call at 0x%x is read as data' % (16 * item.origin))
+                        if unguarded(dx) and ret_reg in pres[2]:
+                            continue
+                    elif dx.c.name.startswith(('call', 'jcal')):
+                        raise Refused('the return address of the call at 0x%x is read as data' % (16 * item.origin))
+                    if unguarded(dx) and any(l == 'R' and r == ret_reg for l, r in dx.writes):
+                        continue
+                    fw.extend(succ[x])
+                if not unguarded(item.d) or ret_reg not in must_write:
+                    p_vis = set()
+                    pw = list(succ[k])
+                    while pw:
+                        x = pw.pop()
+                        if x in p_vis:
+                            continue
+                        p_vis.add(x)
+                        itx = items[x]
+                        dx = itx.d
+                        if ret_reg in room_regs[x]:
+                            pw.extend(succ[x])
+                            continue
+                        if any(l == 'R' and r == ret_reg for l, r, _ in dx.reads):
+                            raise Refused('the return address of the call at 0x%x is read as data' % (16 * item.origin))
+                        if dx.c.name.startswith('call_rel'):
+                            pt = first_at.get(itx.target) if itx.target is not None else None
+                            pres = analyze_callee(pt, set()) if pt is not None else None
+                            if pres is None or pres[0] == ret_reg or ret_reg in pres[3]:
+                                raise Refused('the return address of the call at 0x%x is read as data' % (16 * item.origin))
+                            if unguarded(dx) and ret_reg in pres[2]:
+                                continue
+                        elif dx.c.name.startswith(('call', 'jcal')):
+                            continue
+                        if any(l == 'R' and r == ret_reg for l, r in dx.writes):
+                            continue
+                        pw.extend(succ[x])
+                for j in sorted(defs):
+                    items[j].fix = back
             elif name.startswith('call_abs'):
                 # Through a register: the address to return to is the program counter (LEPC) plus the
                 # difference of two numbers, added by the IADD3 that reads the three.

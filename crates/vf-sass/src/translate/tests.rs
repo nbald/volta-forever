@@ -1578,3 +1578,382 @@ fn a_result_of_double_precision_is_read_no_earlier_than_volta_reads_one() {
     let through = ends(&[with_stall(board(DSETP, 0), 2, false), nop, nop], &[32], true);
     assert_eq!(through[0] + through[1], 15, "{through:?}");
 }
+
+fn make_call_rel_item(
+    idx: usize,
+    name: &str,
+    operands: &[(&str, u32)],
+    target: Option<u64>,
+    what: &'static str,
+    what_detail: Option<String>,
+) -> Item {
+    let mut dec70 = Decoder::new(70);
+    let ops: Vec<(&str, assemble::OpVal)> = operands.iter().map(|&(k, v)| (k, assemble::OpVal::Int(v))).collect();
+    let word = assemble::assemble(name, &ops).unwrap_or_else(|| {
+        let mut w = match name {
+            "mov__RuIR_RI" => 0x000fc20000000f00_0000005000087802_u128,
+            "call_rel__RIR" => 0x000fc20003800000_0000000000007944_u128,
+            "ret__REL" => 0x000fc20003800000_0000000008007950_u128,
+            "bssy_" => 0x000fc20003800000_0000000000007945_u128,
+            "bsync_" => 0x000fc20003800000_0000000000007941_u128,
+            _ => panic!("assemble {name} failed"),
+        };
+        let base_d = dec70.decode(w).unwrap_or_else(|| panic!("decode base {name} failed"));
+        let cls = &crate::generated::classes::VF_CLASSES[base_d.class_id as usize];
+        let op_specs = &crate::generated::classes::VF_OPERANDS[cls.10 as usize..(cls.10 + cls.11) as usize];
+        for &(k, v) in operands {
+            let &(_, field_id, scale, op_kind) = op_specs
+                .iter()
+                .find(|&&(nid, _, _, _)| crate::generated::fields::OP_NAMES[nid as usize] == k)
+                .unwrap_or_else(|| panic!("operand {k} not found on {name}"));
+            let actual = if op_kind == 2 && scale > 0 {
+                debug_assert_eq!(v % scale as u32, 0);
+                v as u64 / scale as u64
+            } else {
+                v as u64
+            };
+            w = crate::field::put(field_id, w, actual);
+        }
+        w
+    });
+    let mut item = Item::new(word, idx, what, false);
+    item.first = true;
+    item.target = target;
+    item.what_detail = what_detail;
+    let decoded = dec70.decode(word).unwrap_or_else(|| panic!("decode {name} failed"));
+    assert_eq!(decoded.name, name);
+    item.d = Some(decoded);
+    item
+}
+
+fn empty_func_data(len: usize) -> FuncData {
+    let mut fd = make_borrow_func(&[], 32, &[], &[], false);
+    let mut dec75 = Decoder::new(75);
+    let nop_word: u128 = 0x000fc00000000000_0000000000007918;
+    fd.src = (0..len).map(|_| dec75.decode(nop_word).unwrap()).collect();
+    fd
+}
+
+#[test]
+fn call_rel_multi_predecessor_and_barriers_preserve_all_reaching_movs() {
+    // Diamond:
+    //   0: @P0 BRA -> 3 (0x30)
+    //   1: MOV R8, 0x50
+    //   2: BRA -> 4 (0x40)
+    //   3: MOV R8, 0x50
+    //   4: CALL.REL -> 6 (0x60), back = 0x50
+    //   5: EXIT
+    //   6: RET.REL R8 (target = 0)
+    let mut items = vec![
+        make_call_rel_item(0, "bra_", &[("Pg", 0)], Some(0x30), "same", None),
+        make_call_rel_item(1, "mov__RuIR_RI", &[("Rd", 8), ("Sb", 0x50)], None, "same", None),
+        make_call_rel_item(2, "bra_", &[], Some(0x40), "same", None),
+        make_call_rel_item(3, "mov__RuIR_RI", &[("Rd", 8), ("Sb", 0x50)], None, "same", None),
+        make_call_rel_item(4, "call_rel__RIR", &[], Some(0x60), "same", None),
+        make_call_rel_item(5, "exit_", &[], None, "same", None),
+        make_call_rel_item(6, "ret__REL", &[("Ra", 8)], Some(0), "same", None),
+    ];
+    let fd = empty_func_data(items.len());
+    super::return_addr::return_addresses(&mut items, &[0x30, 0x40, 0x60], &fd).unwrap();
+    assert_eq!(items[1].fix, Some(0x50));
+    assert_eq!(items[3].fix, Some(0x50));
+
+    // Clobbering one predecessor must refuse rather than rewrite only one MOV.
+    let mut bad = vec![
+        make_call_rel_item(0, "bra_", &[("Pg", 0)], Some(0x30), "same", None),
+        make_call_rel_item(
+            1,
+            "iadd3_noimm__RRR_RRR",
+            &[("Rd", 8), ("Ra", 0), ("Rb", 1), ("Rc", 255)],
+            None,
+            "same",
+            None,
+        ),
+        make_call_rel_item(2, "bra_", &[], Some(0x40), "same", None),
+        make_call_rel_item(3, "mov__RuIR_RI", &[("Rd", 8), ("Sb", 0x50)], None, "same", None),
+        make_call_rel_item(4, "call_rel__RIR", &[], Some(0x60), "same", None),
+        make_call_rel_item(5, "exit_", &[], None, "same", None),
+        make_call_rel_item(6, "ret__REL", &[("Ra", 8)], Some(0), "same", None),
+    ];
+    assert!(super::return_addr::return_addresses(&mut bad, &[0x30, 0x40, 0x60], &fd).is_err());
+
+    // Predicated MOV must refuse.
+    let mut pred = vec![
+        make_call_rel_item(
+            0,
+            "mov__RuIR_RI",
+            &[("Pg", 0), ("Rd", 8), ("Sb", 0x20)],
+            None,
+            "same",
+            None,
+        ),
+        make_call_rel_item(1, "call_rel__RIR", &[], Some(0x30), "same", None),
+        make_call_rel_item(2, "exit_", &[], None, "same", None),
+        make_call_rel_item(3, "ret__REL", &[("Ra", 8)], Some(0), "same", None),
+    ];
+    let fd_pred = empty_func_data(pred.len());
+    assert!(super::return_addr::return_addresses(&mut pred, &[0x30], &fd_pred).is_err());
+
+    // Missing MOV on one incoming branch must refuse.
+    let mut missing = vec![
+        make_call_rel_item(0, "bra_", &[("Pg", 0)], Some(0x20), "same", None),
+        make_call_rel_item(1, "mov__RuIR_RI", &[("Rd", 8), ("Sb", 0x30)], None, "same", None),
+        make_call_rel_item(2, "call_rel__RIR", &[], Some(0x40), "same", None),
+        make_call_rel_item(3, "exit_", &[], None, "same", None),
+        make_call_rel_item(4, "ret__REL", &[("Ra", 8)], Some(0), "same", None),
+    ];
+    let fd_miss = empty_func_data(missing.len());
+    assert!(super::return_addr::return_addresses(&mut missing, &[0x20, 0x40], &fd_miss).is_err());
+
+    // BSSY / BSYNC convergence barrier between MOV and CALL.REL must pass.
+    //   0: MOV R20, 0x50
+    //   1: BSSY B0, -> 5 (0x50)
+    //   2: @P0 BRA -> 4 (0x40)
+    //   3: NOP
+    //   4: CALL.REL -> 7 (0x70), back = 0x50
+    //   5: BSYNC B0
+    //   6: EXIT
+    //   7: RET.REL R20
+    let mut bssy_items = vec![
+        make_call_rel_item(0, "mov__RuIR_RI", &[("Rd", 20), ("Sb", 0x50)], None, "same", None),
+        make_call_rel_item(1, "bssy_", &[("barReg", 0)], Some(0x50), "same", None),
+        make_call_rel_item(2, "bra_", &[("Pg", 0)], Some(0x40), "same", None),
+        make_call_rel_item(3, "nop_", &[], None, "same", None),
+        make_call_rel_item(4, "call_rel__RIR", &[], Some(0x70), "same", None),
+        make_call_rel_item(5, "bsync_", &[("barReg", 0)], None, "same", None),
+        make_call_rel_item(6, "exit_", &[], None, "same", None),
+        make_call_rel_item(7, "ret__REL", &[("Ra", 20)], Some(0), "same", None),
+    ];
+    let fd_bssy = empty_func_data(bssy_items.len());
+    super::return_addr::return_addresses(&mut bssy_items, &[0x40, 0x50, 0x70], &fd_bssy).unwrap();
+    assert_eq!(bssy_items[0].fix, Some(0x50));
+
+    // A matching `room: R8 away ... room: R8 back` span on one origin keeps R8 intact across
+    // temporary borrowed writes inside the span.
+    let mut away = make_call_rel_item(1, "nop_", &[], None, "room: away", Some("room: R8 away".into()));
+    away.first = true;
+    let mut inner = make_call_rel_item(1, "mov__RuIR_RI", &[("Rd", 8), ("Sb", 0)], None, "same", None);
+    inner.first = false;
+    let mut back_room = make_call_rel_item(
+        1,
+        "mov__RuIR_RI",
+        &[("Rd", 8), ("Sb", 0)],
+        None,
+        "room: back",
+        Some("room: R8 back".into()),
+    );
+    back_room.first = false;
+    let mut room_items = vec![
+        make_call_rel_item(0, "mov__RuIR_RI", &[("Rd", 8), ("Sb", 0x30)], None, "same", None),
+        away,
+        inner,
+        back_room,
+        make_call_rel_item(2, "call_rel__RIR", &[], Some(0x40), "same", None),
+        make_call_rel_item(3, "exit_", &[], None, "same", None),
+        make_call_rel_item(4, "ret__REL", &[("Ra", 8)], Some(0), "same", None),
+    ];
+    let fd_room = empty_func_data(room_items.len());
+    super::return_addr::return_addresses(&mut room_items, &[0x40], &fd_room).unwrap();
+    assert_eq!(room_items[0].fix, Some(0x30));
+}
+
+#[test]
+fn call_rel_data_constant_collision_and_data_reads_enforced() {
+    // Colliding data constant MOV R20, 0x30 stays untouched while MOV R8, 0x30 is fixed.
+    //   0: MOV R20, 0x30
+    //   1: MOV R8, 0x30
+    //   2: CALL.REL -> 5 (0x50), back = 0x30
+    //   3: IADD3 R0, R20, R2, RZ
+    //   4: EXIT
+    //   5: MOV R8, RZ (kill R8 so callee overwrites R8 on all paths after copying to R2) -> wait:
+    //   5: MOV R2, R8
+    //   6: MOV R8, 0x0
+    //   7: RET.REL R2
+    let mut ok_items = vec![
+        make_call_rel_item(0, "mov__RuIR_RI", &[("Rd", 20), ("Sb", 0x30)], None, "same", None),
+        make_call_rel_item(1, "mov__RuIR_RI", &[("Rd", 8), ("Sb", 0x30)], None, "same", None),
+        make_call_rel_item(2, "call_rel__RIR", &[], Some(0x50), "same", None),
+        make_call_rel_item(
+            3,
+            "iadd3_noimm__RRR_RRR",
+            &[("Rd", 0), ("Ra", 20), ("Rb", 2), ("Rc", 255)],
+            None,
+            "same",
+            None,
+        ),
+        make_call_rel_item(4, "exit_", &[], None, "same", None),
+        make_call_rel_item(5, "mov__RRR_RR", &[("Rd", 2), ("Rb", 8)], None, "same", None),
+        make_call_rel_item(6, "mov__RuIR_RI", &[("Rd", 8), ("Sb", 0)], None, "same", None),
+        make_call_rel_item(7, "ret__REL", &[("Ra", 2)], Some(0), "same", None),
+    ];
+    let fd_ok = empty_func_data(ok_items.len());
+    super::return_addr::return_addresses(&mut ok_items, &[0x50], &fd_ok).unwrap();
+    assert_eq!(ok_items[0].fix, None);
+    assert_eq!(ok_items[1].fix, Some(0x30));
+
+    // Pre-call data read of R8 must refuse.
+    let mut pre_read = vec![
+        make_call_rel_item(0, "mov__RuIR_RI", &[("Rd", 8), ("Sb", 0x30)], None, "same", None),
+        make_call_rel_item(
+            1,
+            "iadd3_noimm__RRR_RRR",
+            &[("Rd", 0), ("Ra", 8), ("Rb", 2), ("Rc", 255)],
+            None,
+            "same",
+            None,
+        ),
+        make_call_rel_item(2, "call_rel__RIR", &[], Some(0x40), "same", None),
+        make_call_rel_item(3, "exit_", &[], None, "same", None),
+        make_call_rel_item(4, "ret__REL", &[("Ra", 8)], Some(0), "same", None),
+    ];
+    let fd_pre = empty_func_data(pre_read.len());
+    assert!(super::return_addr::return_addresses(&mut pre_read, &[0x40], &fd_pre).is_err());
+
+    // Sibling-branch data read of R8 must refuse.
+    let mut sib_read = vec![
+        make_call_rel_item(0, "mov__RuIR_RI", &[("Rd", 8), ("Sb", 0x40)], None, "same", None),
+        make_call_rel_item(1, "bra_", &[("Pg", 0)], Some(0x40), "same", None),
+        make_call_rel_item(2, "bra_", &[], Some(0x30), "same", None),
+        make_call_rel_item(3, "call_rel__RIR", &[], Some(0x60), "same", None),
+        make_call_rel_item(
+            4,
+            "iadd3_noimm__RRR_RRR",
+            &[("Rd", 0), ("Ra", 8), ("Rb", 2), ("Rc", 255)],
+            None,
+            "same",
+            None,
+        ),
+        make_call_rel_item(5, "exit_", &[], None, "same", None),
+        make_call_rel_item(6, "ret__REL", &[("Ra", 8)], Some(0), "same", None),
+    ];
+    let fd_sib = empty_func_data(sib_read.len());
+    assert!(super::return_addr::return_addresses(&mut sib_read, &[0x30, 0x40, 0x60], &fd_sib).is_err());
+
+    // Post-call data read when callee preserves R8 (copies R8 -> R2 without killing R8) must refuse.
+    let mut post_read = vec![
+        make_call_rel_item(0, "mov__RuIR_RI", &[("Rd", 8), ("Sb", 0x20)], None, "same", None),
+        make_call_rel_item(1, "call_rel__RIR", &[], Some(0x40), "same", None),
+        make_call_rel_item(
+            2,
+            "iadd3_noimm__RRR_RRR",
+            &[("Rd", 0), ("Ra", 8), ("Rb", 2), ("Rc", 255)],
+            None,
+            "same",
+            None,
+        ),
+        make_call_rel_item(3, "exit_", &[], None, "same", None),
+        make_call_rel_item(4, "mov__RRR_RR", &[("Rd", 2), ("Rb", 8)], None, "same", None),
+        make_call_rel_item(5, "ret__REL", &[("Ra", 2)], Some(0), "same", None),
+    ];
+    let fd_post = empty_func_data(post_read.len());
+    assert!(super::return_addr::return_addresses(&mut post_read, &[0x40], &fd_post).is_err());
+
+    // Callee internal data read of R8 before RET.REL must refuse.
+    let mut callee_read = vec![
+        make_call_rel_item(0, "mov__RuIR_RI", &[("Rd", 8), ("Sb", 0x20)], None, "same", None),
+        make_call_rel_item(1, "call_rel__RIR", &[], Some(0x30), "same", None),
+        make_call_rel_item(2, "exit_", &[], None, "same", None),
+        make_call_rel_item(
+            3,
+            "iadd3_noimm__RRR_RRR",
+            &[("Rd", 0), ("Ra", 8), ("Rb", 2), ("Rc", 255)],
+            None,
+            "same",
+            None,
+        ),
+        make_call_rel_item(4, "ret__REL", &[("Ra", 8)], Some(0), "same", None),
+    ];
+    let fd_callee = empty_func_data(callee_read.len());
+    assert!(super::return_addr::return_addresses(&mut callee_read, &[0x30], &fd_callee).is_err());
+}
+
+#[test]
+fn call_rel_colliding_data_constant_kernel_translates_and_keeps_data_mov() {
+    let cubin = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/kernels/translate/k_call_rel_mov.sm75.cubin"
+    ));
+    let mut decoder = Decoder::new(70);
+    for borrow in [Options::default().borrow, 8] {
+        let options = Options {
+            borrow,
+            ..Options::default()
+        };
+        let result = translate_with_options(cubin, true, &options).unwrap();
+        assert!(
+            result.report.iter().all(|f| f.refused.is_none()),
+            "refused under borrow={borrow:?}: {:?}",
+            result.report
+        );
+        let out = crate::elf::Elf::parse(&result.bytes).unwrap();
+        let code = &out.sections[out.section(".text.k_call_rel_collision").unwrap()].data;
+        let map = result.map.as_ref().unwrap();
+        let at = |old_off: u64| -> u128 {
+            let (_, new_off, _, _) = map
+                .iter()
+                .find(|(f, _, old, w)| f == "k_call_rel_collision" && *old == old_off && w == "same")
+                .unwrap();
+            let pos = *new_off as usize;
+            u128::from_le_bytes(code[pos..pos + 16].try_into().unwrap())
+        };
+        let new_back = map
+            .iter()
+            .find(|(f, _, old, _)| f == "k_call_rel_collision" && *old == 0x120)
+            .map(|(_, new_off, _, _)| *new_off as u32)
+            .unwrap();
+        assert!(new_back > 0x120, "expected shifted return target, got 0x{new_back:x}");
+        let d_ret_mov = decoder.decode(at(0x100)).unwrap();
+        let d_data_mov = decoder.decode(at(0x120)).unwrap();
+        assert_eq!(d_ret_mov.op_or_name("Sb", 0), new_back);
+        assert_eq!(d_data_mov.op_or_name("Sb", 0), 0x120);
+    }
+}
+
+/// A guarded `@P0 RET.REL` in a callee must not stop the callee CFG walk: the fall-through path
+/// still runs when `!P0`, so a return through a copied register on fall-through succeeds while a
+/// data read or conflicting `RET.REL` register on fall-through refuses.
+#[test]
+fn call_rel_guarded_ret_follows_fallthrough_path() {
+    // 1. Valid: guarded `@P0 RET.REL R8` falls through to `MOV R2, R8; RET.REL R2`.
+    let mut ok_fallthrough = vec![
+        make_call_rel_item(0, "mov__RuIR_RI", &[("Rd", 8), ("Sb", 0x20)], None, "same", None),
+        make_call_rel_item(1, "call_rel__RIR", &[], Some(0x30), "same", None),
+        make_call_rel_item(2, "exit_", &[], None, "same", None),
+        make_call_rel_item(3, "ret__REL", &[("Pg", 0), ("Ra", 8)], Some(0), "same", None),
+        make_call_rel_item(4, "mov__RRR_RR", &[("Rd", 2), ("Rb", 8)], None, "same", None),
+        make_call_rel_item(5, "ret__REL", &[("Ra", 2)], Some(0), "same", None),
+    ];
+    let fd_ok = empty_func_data(ok_fallthrough.len());
+    assert!(super::return_addr::return_addresses(&mut ok_fallthrough, &[0x30], &fd_ok).is_ok());
+    assert_eq!(ok_fallthrough[0].fix, Some(0x20));
+
+    // 2. Refused: guarded `@P0 RET.REL R8` falls through to a data read of R8 before `RET.REL R8`.
+    let mut data_read_fallthrough = vec![
+        make_call_rel_item(0, "mov__RuIR_RI", &[("Rd", 8), ("Sb", 0x20)], None, "same", None),
+        make_call_rel_item(1, "call_rel__RIR", &[], Some(0x30), "same", None),
+        make_call_rel_item(2, "exit_", &[], None, "same", None),
+        make_call_rel_item(3, "ret__REL", &[("Pg", 0), ("Ra", 8)], Some(0), "same", None),
+        make_call_rel_item(
+            4,
+            "iadd3_noimm__RRR_RRR",
+            &[("Rd", 0), ("Ra", 8), ("Rb", 2), ("Rc", 255)],
+            None,
+            "same",
+            None,
+        ),
+        make_call_rel_item(5, "ret__REL", &[("Ra", 8)], Some(0), "same", None),
+    ];
+    let fd_read = empty_func_data(data_read_fallthrough.len());
+    assert!(super::return_addr::return_addresses(&mut data_read_fallthrough, &[0x30], &fd_read).is_err());
+
+    // 3. Refused: guarded `@P0 RET.REL R8` falls through to `RET.REL R9` (different input register).
+    let mut conflict_fallthrough = vec![
+        make_call_rel_item(0, "mov__RuIR_RI", &[("Rd", 8), ("Sb", 0x20)], None, "same", None),
+        make_call_rel_item(1, "call_rel__RIR", &[], Some(0x30), "same", None),
+        make_call_rel_item(2, "exit_", &[], None, "same", None),
+        make_call_rel_item(3, "ret__REL", &[("Pg", 0), ("Ra", 8)], Some(0), "same", None),
+        make_call_rel_item(4, "ret__REL", &[("Ra", 9)], Some(0), "same", None),
+    ];
+    let fd_conflict = empty_func_data(conflict_fallthrough.len());
+    assert!(super::return_addr::return_addresses(&mut conflict_fallthrough, &[0x30], &fd_conflict).is_err());
+}

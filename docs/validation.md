@@ -62,6 +62,13 @@ registers and predicates by itself.
 **Same.** The instruction reads as the original, with a branch target moved to where its
 instruction now is.
 
+**Return addresses.** For every relative call (`CALL.REL`), the validator independently traces `MOV
+R, imm` definitions across the original control-flow graph (through branches and `BSSY`/`BREAK`
+barriers, treating matched `room` brackets transparently) to the callee's `RET.REL` register(s)
+and checks that every reaching return-address `MOV` holds the new address of the instruction after
+the call in the result. Outside those proved return-address definitions and `LEPC`+`IADD3` indirect-call
+pairs, no `MOV R, imm` may have its immediate rewritten (`stale_ret` and `data_mov_fixed`, section 3).
+
 **Ordinary registers.** The instruction reads as the original with each uniform register replaced
 by an ordinary one, always the same one, and the mnemonic without its U. An operand of two uniform
 registers (as the destination and the addend of `UIMAD.WIDE` and `UIMAD.WIDE.X`) is printed as its
@@ -315,7 +322,7 @@ with the next instruction waiting, and the distances between the steps and after
 ## 3. Controls
 
 A check that never objects proves nothing. `reference/controls.py` makes the reference translator
-wrong on purpose, one way at a time, and counts what the validator finds in the result: 117
+wrong on purpose, one way at a time, and counts what the validator finds in the result: 119
 controls, each described at the head of that file. A control that changes translations and meets
 no objection anywhere is a hole in the validator, or a control that tests nothing.
 
@@ -345,7 +352,14 @@ of the first instruction of a function that a rule translates to ordinary regist
 default, one process a cubin, on 49 cubins (35 of the held-out corpus and of the 39 above, on
 which `unpaired` stopped until it took the arguments of the translator by their names, and 14
 others), `unpaired` changed the translation of 46 and was objected to in each, `misruled` changed
-45 and was objected to in each.
+45 and was objected to in each. Two further controls came with CFG return-address checking
+(`CALL.REL`): `stale_ret` drops the relocation on the first proved return-address `MOV R, imm`,
+and `data_mov_fixed` shifts an unproved (data-constant) `MOV R, imm` by `+0x10`. On the 12 test
+cubins (`tests/kernels/translate/*.sm75.cubin`) and 4 PyTorch cubins with relative calls (`0266`,
+`0316`, `0393`, `0439`), `stale_ret` changed 7 cubins and was objected to in all 7 (problems:
+1, 1, 1, 18, 182, 24, 1) and `data_mov_fixed` changed 3 cubins (`k_call_rel_mov.sm75.cubin`,
+`0266.sm_75.cubin`, `0316.sm_75.cubin`) and was objected to in all 3 (problems: 1, 9, 72), whereas
+before the rule both passed with 0 problems (`k_call_rel_mov.sm75.cubin`, `0266.sm_75.cubin`).
 
 A control may change a translation that stays right, and is then rightly not objected to there:
 `alive_home` moves every home to the next register, which may be free too; `short_home` leaves
@@ -745,10 +759,11 @@ layer, and each kernel must give what the sm_70 build gives on the same inputs. 
 is compared with itself first: a kernel whose result depends on the order of its threads would
 fail there, and would prove nothing.
 
-Twelve source files, 62 kernels: all the same as their native builds. They cover uniform
-registers and predicates, calls, loops, minima and maxima, jump tables, memory instructions,
-conversions, instructions on uniform registers under a guard, and `UIMAD` with an immediate and
-`UIMAD.WIDE` (`k_uimad.cu`, since pull request #15), one kind of rewriting each.
+Thirteen source files, 64 kernels: all the same as their native builds. They cover uniform
+registers and predicates, calls, `CALL.REL` return-address resolution across branches, barriers,
+and colliding data constants (`k_call_rel_mov.cu`), loops, minima and maxima, jump tables, memory
+instructions, conversions, instructions on uniform registers under a guard, and `UIMAD` with an
+immediate and `UIMAD.WIDE` (`k_uimad.cu`, since pull request #15), one kind of rewriting each.
 
 Two of the files run a second time from a cubin changed by hand into something that compilers
 do not write, or write rarely, and that a translation must still get right:

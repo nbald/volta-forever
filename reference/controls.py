@@ -29,6 +29,10 @@ sm_75 cubins named with it, and counts what validate.py finds. A control that pa
                 sm_80: the schedule sees straight-line code, and so did the validator's rule
                 until 2026-11-25)
     returns     a number that makes a return address is off by one instruction
+    stale_ret   one CALL.REL return-address MOV whose target shifts keeps its old offset
+    data_mov_fixed
+                one non-return-address MOV immediate matching a shifted code offset is
+                rewritten to the new offset
     waitless    what an instruction waited for, the first instruction of what it became does not
                 wait for (ULDC lost its wait that way until a review found it)
     unlisted    the translation as it is, and a map that leaves out one instruction of each
@@ -448,8 +452,8 @@ def complemented(mc, data, same, listing):
 
 def patched(control):
     """{method name: replacement} for `control`."""
-    stand_ins, liveness, late, schedule, return_addresses = (
-        Function.stand_ins, Function.liveness, Function.late, Function.schedule, Function.return_addresses)
+    stand_ins, liveness, late, schedule, return_addresses, finish_orig = (
+        Function.stand_ins, Function.liveness, Function.late, Function.schedule, Function.return_addresses, Function.finish)
     matrix_load, matrix_product, kept = Function.matrix_load, Function.matrix_product, Function.kept
     kept_for_rows, whole_rows, half_of_pair, converted = Function.kept_for_rows, Function.whole_rows, Function.half_of_pair, Function.converted
     given_back = Function.given_back
@@ -571,6 +575,40 @@ def patched(control):
             if item.fix is not None and item.fix + 16 <= 16 * len(self.src):
                 item.fix += 16
                 break
+
+    def stale_ret_finish(self):
+        new_of = {16 * item.origin: 16 * k for k, item in enumerate(self.items) if item.first}
+        new_of[16 * len(self.src)] = 16 * len(self.items)
+        call_backs = {16 * it.origin + 16 for it in self.items if it.d.c.name.startswith('call_rel')}
+        target_at = getattr(self, '_stale_ret_at', None)
+        for item in self.items:
+            if item.fix is not None and item.fix in call_backs and new_of.get(item.fix, item.fix) != item.fix:
+                if target_at is None or target_at == 16 * item.origin:
+                    self._stale_ret_at = 16 * item.origin
+                    item.fix = None
+                    break
+        return finish_orig(self)
+
+    def data_mov_fixed_finish(self):
+        new_of = {16 * item.origin: 16 * k for k, item in enumerate(self.items) if item.first}
+        new_of[16 * len(self.src)] = 16 * len(self.items)
+        target_at = getattr(self, '_data_mov_fixed_at', None)
+        for item in self.items:
+            if item.fix is not None or not item.first or item.what != 'same':
+                continue
+            d = item.d
+            if not (d.c.name == 'mov__RuIR_RI' or (
+                d.mnemonic == 'MOV' and 'Sb' in d.ops and 'Rb' not in d.ops and 'Sb_bank' not in d.ops
+                and d.ops.get('PixMaskU04', 15) == 15
+            )):
+                continue
+            imm = d.ops['Sb']
+            if imm > 0 and imm in new_of and new_of[imm] != imm:
+                if target_at is None or target_at == 16 * item.origin:
+                    self._data_mov_fixed_at = 16 * item.origin
+                    item.fix = imm
+                    break
+        return finish_orig(self)
 
     def waitless(self):
         for item in self.items:
@@ -868,6 +906,8 @@ def patched(control):
         'doublesoon': {'schedule': doublesoon},
         'doubleacross': {'schedule': doubleacross},
         'returns': {'return_addresses': returns},
+        'stale_ret': {'finish': stale_ret_finish},
+        'data_mov_fixed': {'finish': data_mov_fixed_finish},
         'waitless': {'schedule': waitless},
         'unlisted': {},
         'swapped': {},
@@ -1339,7 +1379,7 @@ def patched(control):
     return all_controls[control]
 
 
-CONTROLS = ['as it is', 'unsaved', 'blind', 'cut', 'masks', 'nowait', 'close', 'doublesoon', 'doubleacross', 'returns', 'waitless', 'unlisted', 'swapped', 'batched', 'unmoved', 'named', 'unguarded', 'lanes', 'unwaited', 'unordered', 'complement_rewritten', 'complement_same', 'soon', 'partial', 'boardless', 'unmasked', 'early', 'unheld', 'unwritten', 'stale', 'unkept', 'unpaired', 'misruled', 'slowno', 'slowshort', 'slownowait', 'slownever', 'slowfree', 'slowsaved', 'alive_scratch']
+CONTROLS = ['as it is', 'unsaved', 'blind', 'cut', 'masks', 'nowait', 'close', 'doublesoon', 'doubleacross', 'returns', 'stale_ret', 'data_mov_fixed', 'waitless', 'unlisted', 'swapped', 'batched', 'unmoved', 'named', 'unguarded', 'lanes', 'unwaited', 'unordered', 'complement_rewritten', 'complement_same', 'soon', 'partial', 'boardless', 'unmasked', 'early', 'unheld', 'unwritten', 'stale', 'unkept', 'unpaired', 'misruled', 'slowno', 'slowshort', 'slownowait', 'slownever', 'slowfree', 'slowsaved', 'alive_scratch']
 # (Those of pairs of products on whole rows: only when the translator makes them, not with VF_PAIRS=0.)
 PAIR_CONTROLS = ['rowlane', 'otherrow', 'rowwait', 'rowread', 'halfswap', 'halfk', 'inplace', 'stepfast', 'unsettled', 'unsynced', 'unpermuted', 'unconverted', 'notalso']
 CONTROLS += PAIR_CONTROLS
@@ -1466,7 +1506,7 @@ def run(mc, control, path, out_dir, untouched, validated=True):
     translation as it is is kept there and not validated.)"""
     originals = {name: getattr(Function, name) for name in ('stand_ins', 'liveness', 'late', 'schedule', 'return_addresses', 'matrix_load', 'matrix_product', 'kept', 'kept_gathering', 'given_back', 'all_predicates', 'waits_for', 'masked', 'translate', 'one',
                                                              'kept_for_rows', 'whole_rows', 'half_of_pair', 'converted',
-                                                             'from_memory', 'to_memory', 'frame_top', 'load_word', 'store_word', 'read_back')}
+                                                             'from_memory', 'to_memory', 'frame_top', 'load_word', 'store_word', 'read_back', 'finish')}
     for name, replacement in patched(control).items():
         setattr(Function, name, replacement)
     stall, relocations_of = translate.with_stall, translate.relocations_of

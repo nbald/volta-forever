@@ -50,7 +50,7 @@ failure, 2 when a step could not run here (what it needs is missing). Two and a 
 or to a lowering, run at least:
 
 ```sh
-tests/gpu/run.sh 0                       # 0: the GPU's index in PCI order; 233 cases (229 at 0.1.6)
+tests/gpu/run.sh 0                       # 0: the GPU's index in PCI order; 234 cases (229 at 0.1.6)
 VF_CAPABILITY=8.0 tests/gpu/run.sh 0
 ```
 

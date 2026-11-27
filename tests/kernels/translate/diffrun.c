@@ -1029,6 +1029,27 @@ int main(int argc, char** argv) {
     test_call_loop(rm, tm, ha, N, da, dref, dtest);
     test_binary_i32("k_simple_min", rm, tm, ha, hb, N, da, db, dref, dtest);
 
+    // k_call_rel_mov.cu: CALL.REL return-address resolution with a colliding data constant and
+    // divergent branches across nested calls.
+    {
+        int n = N, rounds = getenv("DIFFRUN_ROUNDS") ? atoi(getenv("DIFFRUN_ROUNDS")) : 6;
+        uint32_t a = 7u, b = 0x1357u;
+        size_t chunk_bytes = (size_t)N * 72 * 4;
+        uint32_t* hchunk = calloc(1, chunk_bytes);
+        if (!hchunk) { fprintf(stderr, "oom\n"); return 2; }
+        for (int i = 0; i < N; i++) {
+            hchunk[i * 72] = hu[i];
+            hchunk[i * 72 + 1] = (uint32_t)hb[i];
+        }
+        CUdeviceptr dchunk = dalloc(chunk_bytes);
+        CK(cuMemcpyHtoD_v2(dchunk, hchunk, chunk_bytes));
+        test_same_output("k_call_rel_collision", rm, tm, chunk_bytes, (void*[]){&dchunk, &a, &b, &n}, 4);
+        cuMemFree_v2(dchunk);
+        free(hchunk);
+        CK(cuMemcpyHtoD_v2(da, hu, N * 4));
+        test_same_output("k_call_rel_converge", rm, tm, N * 4, (void*[]){&da, &rounds, &n}, 3);
+    }
+
     cuMemFree_v2(da); cuMemFree_v2(db); cuMemFree_v2(dref); cuMemFree_v2(dtest);
     cuCtxDestroy_v2(ctx);
     free(rdata); free(tdata);
