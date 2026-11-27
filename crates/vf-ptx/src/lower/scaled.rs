@@ -87,6 +87,16 @@ impl<'a> Body<'a> {
     /// overflow: UE8M0 scales go up to 2^127, and their product can reach 2^254, which overflows
     /// f32 but not f64.
     pub(super) fn scale_byte_f64(&mut self, register: &str, byte_offset: u32, ue4m3: bool) -> String {
+        self.scale_byte_f64_biased(register, byte_offset, ue4m3, 0)
+    }
+
+    pub(super) fn scale_byte_f64_biased(
+        &mut self,
+        register: &str,
+        byte_offset: u32,
+        ue4m3: bool,
+        exp_boost: u32,
+    ) -> String {
         let byte = self.fresh();
         match byte_offset {
             0 => emit!(self, "and.b32 {byte}, {register}, 0xff;"),
@@ -138,7 +148,7 @@ impl<'a> Body<'a> {
             let [exp, hi, lo]: [String; 3] = self.fresh_n();
             let result = self.fresh_wide();
             self.scratch_predicate = true;
-            emit!(self, "add.u32 {exp}, {byte}, 896;");
+            emit!(self, "add.u32 {exp}, {byte}, {};", 896 + exp_boost);
             emit!(self, "shl.b32 {hi}, {exp}, 20;"); // bits 30:20 of hi word = exponent bits 10:0
             emit!(self, "mov.b32 {lo}, 0;");
             emit!(self, "mov.b64 {result}, {{{lo}, {hi}}};");
@@ -219,8 +229,10 @@ impl<'a> Body<'a> {
         let sb_col0_reg = self.shuffle(scale_b, Lane::InPair(thread_id_b));
         let sb_col1_reg = self.shuffle(scale_b, Lane::InPair(4 + thread_id_b));
 
-        let scale_a_lower_f64 = self.scale_byte_f64(&sa_lower_reg, byte_id_a, false);
-        let scale_a_upper_f64 = self.scale_byte_f64(&sa_upper_reg, byte_id_a, false);
+        // Absorb 2^8 per unscaled E4M3 operand into UE8M0's exponent bias (eliminating HMUL2).
+        let e4m3_exp_boost = 8 * u32::from(a_type == Fp8::E4m3) + 8 * u32::from(b_type == Fp8::E4m3);
+        let scale_a_lower_f64 = self.scale_byte_f64_biased(&sa_lower_reg, byte_id_a, false, e4m3_exp_boost);
+        let scale_a_upper_f64 = self.scale_byte_f64_biased(&sa_upper_reg, byte_id_a, false, e4m3_exp_boost);
         let scale_b_col0_f64 = self.scale_byte_f64(&sb_col0_reg, byte_id_b, false);
         let scale_b_col1_f64 = self.scale_byte_f64(&sb_col1_reg, byte_id_b, false);
         let mut combined_f64: [String; 4] = Default::default();
@@ -250,10 +262,16 @@ impl<'a> Body<'a> {
         let block_sum_names: Vec<&str> = block_sums.iter().map(String::as_str).collect();
         let mut of_a = Vec::new();
         for rows in a.chunks(2) {
-            let (upper, lower) = (self.fp8_halves(a_type, rows[0]), self.fp8_halves(a_type, rows[1]));
+            let (upper, lower) = (
+                self.fp8_halves_scaled(a_type, rows[0], false),
+                self.fp8_halves_scaled(a_type, rows[1], false),
+            );
             of_a.extend([upper[0].clone(), lower[0].clone(), upper[1].clone(), lower[1].clone()]);
         }
-        let of_b: Vec<String> = b.iter().flat_map(|b_reg| self.fp8_halves(b_type, b_reg)).collect();
+        let of_b: Vec<String> = b
+            .iter()
+            .flat_map(|b_reg| self.fp8_halves_scaled(b_type, b_reg, false))
+            .collect();
         let (of_a_refs, of_b_refs): (Vec<&str>, Vec<&str>) = (
             of_a.iter().map(String::as_str).collect(),
             of_b.iter().map(String::as_str).collect(),

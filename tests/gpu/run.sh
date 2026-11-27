@@ -270,6 +270,12 @@ rb over "PTX for sm_75 retargeted" 00000000 40b1ac30 00000054 00000005
 tc ampere "$G/k_ampere.135.sm80.ptx" "PTX for sm_80 retargeted \(1 module, 25 tensor-core instructions rewritten\)" "31 kernels, 0 wrong"
 # FP8: the conversions both ways, and the products, which run on the tensor cores as products of halves.
 tc fp8 "$G/k_fp8.135.sm89.ptx" "PTX for sm_89 retargeted \(1 module, 8 tensor-core instructions rewritten\)" "19 kernels, 0 wrong"
+# Exhaustive bit-pinning of FP8 decodes (all 65,536 pairs for f16x2 and bf16x2, NaN payloads included)
+# and single plain / block-scaled m16n8k32 products exercising all 14 E4M3 subnormal bytes on a V100.
+[ -x "$out/bin/fp8_bits" ] && [ "$out/bin/fp8_bits" -nt "$G/fp8_bits.c" ] || gcc -O2 -o "$out/bin/fp8_bits" "$G/fp8_bits.c" -ldl -lm || exit 2
+log=$out/logs/fp8-bits.log
+DRVRUN_LIBCUDA=$proxy/libcuda.so.1 VF_LOG_LEVEL=2 "$out/bin/fp8_bits" "$G/k_fp8_bits.135.sm89.ptx" "$G/blackwell/k_mma_scaled_forms.135.sm120a.ptx" >"$log" 2>&1
+check fp8-bits "^PASS fp8-bits:" "PTX for sm_89 retargeted \(1 module, 3 tensor-core instructions rewritten\)"
 # The conversions of the 4-bit floats (E2M1) and of the exponents alone (UE8M0), against host models.
 tc fp4 "$G/k_fp4.135.sm120a.ptx" "PTX for sm_120 retargeted \(1 module\)" "10 kernels, 0 wrong"
 # The same conversions against what an RTX 5090 computed: on the inputs of the

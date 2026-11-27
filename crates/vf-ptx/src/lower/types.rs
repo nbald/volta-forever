@@ -42,6 +42,8 @@ pub(super) enum Form {
     QCols,
     /// The four `e4m3` bytes of a register as halves: bytes 0 and 1, then bytes 2 and 3 (2 registers).
     E4m3,
+    /// The four `e4m3` bytes divided by 256 as halves (for deferred UE8M0 scale folding).
+    E4m3Unscaled,
     /// The four `e5m2` bytes of a register, likewise.
     E5m2,
     /// The two bf16 elements of a register as f32 (2 registers).

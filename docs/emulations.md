@@ -493,16 +493,22 @@ gathered by shuffles.
 ### Conversions
 
 **Decode (FP8 to f16).** Every value of `e4m3` and `e5m2` is exactly a half. `e5m2` has the
-exponent of a half: its byte is the upper byte of the half. `e4m3` has a narrower exponent,
-but its seven bits below the sign, placed in bits 13..7 of a half, give the value divided
-by 256 (the exponent fields differ by exactly 8). Multiplication by 256 (a half) recovers
-the value, exactly. The NaN byte `0x7f` of `e4m3` (which would decode to 480) is detected:
-bits 14..9 are set to make a NaN of the same sign.
+exponent of a half: `prmt.b32` (`0x1404` / `0x3424`) places a byte pair into `.f16x2`
+without `shr.u32` unpacks. For `e4m3`, `prmt.b32` (`0x4140` / `0x4342`) unpacks two bytes
+into bits `[7:0]` and `[23:16]`; `shl 7` / `shl 8`, `& 0x3f803f80`, and `lop3.b32` (`0xF8`
+with `0x80008000`) place the sign at bit 15 and magnitude at bits 13..7 (leaving bit 14 clear),
+giving the value divided by 256. Adding `0x00800080` sets bit 14 iff all 7 magnitude bits are 1
+(`0x7f`/`0xff` NaN, without overflowing into sign bit 15); multiplying by 256 (`0x5c005c00`)
+via `mul.rn.f16x2` recovers all finite values and subnormals while `lop3.b32` merges the bit-13
+NaN flag (`0x4000 -> 0x2000`, `0x5f80 | 0x2000 = 0x7f80`, or `0xdf80 | 0x2000 = 0xff80`)
+instead of multi-shift subtraction. When feeding UE8M0 block-scaled products (`kind::mxf8f6f4`),
+the `2^8` factor per `e4m3` operand is folded directly into UE8M0's exponent bias (`896 + 8` or
+`896 + 16`), omitting `mul.rn.f16x2` and setting bit 14 (`0x3f80 | 0x4000 = 0x7f80`) for NaN.
 
 | Form | Instructions | Exact |
 |---|---|---|
-| `cvt.rn.f16x2.e4m3x2` | 30 (in the test kernel) | yes |
-| `cvt.rn.f16x2.e5m2x2` | 14 | yes |
+| `cvt.rn.f16x2.e4m3x2` | 14 (12 in `fp8_pair`; 31 PTX / 21 SASS in the test kernel) | yes |
+| `cvt.rn.f16x2.e5m2x2` | 3 (1 `prmt.b32`; 20 PTX / 13 SASS in the test kernel) | yes |
 
 **Encode (f32 to FP8).** The value (divided by 256 for `e4m3`) is cut to a half towards
 zero (`cvt.rz.f16.f32`), a bit records whether the cut dropped anything, and the byte is
@@ -531,9 +537,9 @@ becomes a pair of halves (exact, as above), and the product is four FP16 `m16n8k
 row (eight of Volta's `mma.m8n8k4`). No lane is asked for anything to decode, and the
 halves of an operand used by several products are made once.
 
-**Instruction count.** 225 to 353 instructions per product (the range is across the three
-type combinations of the test kernels: e4m3xe4m3, e4m3xe5m2, e5m2xe4m3). An e5m2 operand
-costs less to decode: e5m2xe5m2 takes 64 instructions fewer than e5m2xe4m3.
+**Instruction count.** 130 to 218 PTX instructions per product (164 to 228 non-NOP SASS
+instructions in the test kernels across e5m2xe4m3, e4m3xe5m2, e4m3xe4m3). An e5m2 operand
+costs less to decode: e5m2xe5m2 takes 44 PTX instructions fewer than e5m2xe4m3.
 
 **Exactness.** The conversion to halves is exact, and the products are FP16 products on
 Volta's tensor cores, with what section 2 says of them: on the inputs of the test suite,
@@ -541,9 +547,12 @@ where the sums are exact, no difference from the host model nor from an RTX 5090
 2026-11-17); on arbitrary values, last bits that depend on how the sums are made (the
 MXF8F6F4 row of section 8 shows how much on E4M3 operands).
 
-**Test cases.** `tests/gpu/run.sh`: `fp8` (19 kernels, 0 wrong). Tests cover every byte
-pair decoded, conversions at and around every value and halfway point of both formats,
-products of the three type combinations, and operands from `ldmatrix`.
+**Test cases.** `tests/gpu/run.sh`: `fp8` (19 kernels, 0 wrong) and `fp8-bits` (all 65,536
+operand pairs for `cvt.rn.{f16x2,bf16x2}.{e4m3x2,e5m2x2}` pinned bit-for-bit including NaN
+payloads, plus single plain `m16n8k32` and `kind::mxf8f6f4` products exercising all 14 E4M3
+subnormal bytes). Tests cover every byte pair decoded, conversions at and around every value
+and halfway point of both formats, products of the three type combinations, and operands
+from `ldmatrix`.
 
 ## 7. FP4 and exponent-only formats
 
@@ -623,17 +632,19 @@ For each block:
    first shuffled to the split-octet `mma.m8n8k4.row.col` arrangement and then decoded in
    place to exact f16x2 halves via the `prmt`/`lop3` lookup (8 nibbles per `.b32` word,
    zero `HMUL2`). For E4M3 and E5M2 (`kind::mxf8f6f4`), bytes are decoded to halves as in
-   section 6.
+   section 6 (with `e4m3`'s `2^8` scale absorbed into UE8M0's exponent bias).
 2. Each block is computed on Volta's `mma.m8n8k4` (section 2) into a zero-initialized f32
    accumulator. Both FP4 forms use the single-instruction `mma.m8n8k4.row.col` split-octet
    layout (8 Volta `mma.m8n8k4` instructions = 32 HMMA steps total for K=64, reducing across
-   octets with four `bfly 8` exchanges per block). The f32 block sum is exact for E2M1
+   octets with four `bfly 8` exchanges per block). `kind::mxf8f6f4` keeps the 8-step
+   `mma.m8n8k4` chain (section 2), preserving bit-identical block sums. The f32 block sum is exact for E2M1
    (every term is a quarter, and sums reach at most 576 for NVFP4 or 1,152 for MXFP4).
 3. Each block sum is multiplied by `scale_A * scale_B` and added to the `f64` accumulator
    (kept in split-octet layout across blocks for FP4). For NVFP4, UE4M3 scales are decoded
    to `value * 2^-8` in f32 (exact normal values) with `* 2^16` folded once onto `scale_A` per
    block, then combined and applied in f32 before widening to f64 (exact for the small
-   integer-of-quarters block sums); MXFP4 and MXF8F6F4 keep UE8M0 scales in f64.
+   integer-of-quarters block sums); MXFP4 and MXF8F6F4 keep UE8M0 scales in f64 (with `+8`
+   per `e4m3` operand folded into UE8M0's exponent bias for MXF8F6F4).
 4. The final f64 sum is converted to f32 (truncation toward zero for `scale_vec::4X`,
    round-to-nearest-even for `scale_vec::2X` and `1X`, `0x7fffffff` on NaN) and, for FP4,
    gathered back to Turing's `D` layout once at the end.

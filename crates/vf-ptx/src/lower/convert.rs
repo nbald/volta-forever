@@ -150,63 +150,95 @@ impl<'a> Body<'a> {
     /// The four FP8 bytes of `register` as halves, exactly: bytes 0 and 1 in one register, bytes 2
     /// and 3 in another.
     pub(super) fn fp8_halves(&mut self, kind: Fp8, register: &str) -> Vec<String> {
-        if let Some(found) = self.recall(kind.form(), &[register]) {
+        self.fp8_halves_scaled(kind, register, true)
+    }
+
+    /// Four FP8 bytes as halves; when `kind == Fp8::E4m3` and `scale_256 == false`, values remain
+    /// divided by 256 so a subsequent power-of-two scale (such as UE8M0) absorbs the 2^8 factor.
+    pub(super) fn fp8_halves_scaled(&mut self, kind: Fp8, register: &str, scale_256: bool) -> Vec<String> {
+        let form = if kind == Fp8::E4m3 && !scale_256 {
+            Form::E4m3Unscaled
+        } else {
+            kind.form()
+        };
+        if let Some(found) = self.recall(form, &[register]) {
             return found;
         }
-        let upper = self.fresh();
-        emit!(self, "shr.u32 {upper}, {register}, 16;");
-        let halves = vec![self.fp8_pair(kind, register), self.fp8_pair(kind, &upper)];
-        self.remember(kind.form(), &[register], &halves);
+        let halves = if kind == Fp8::E5m2 {
+            let [lo, hi]: [String; 2] = self.fresh_n();
+            emit!(self, "prmt.b32 {lo}, {register}, 0, 0x1404;");
+            emit!(self, "prmt.b32 {hi}, {register}, 0, 0x3424;");
+            vec![lo, hi]
+        } else {
+            let [lo_bytes, hi_bytes]: [String; 2] = self.fresh_n();
+            emit!(self, "prmt.b32 {lo_bytes}, {register}, 0, 0x4140;");
+            emit!(self, "prmt.b32 {hi_bytes}, {register}, 0, 0x4342;");
+            vec![
+                self.fp8_e4m3_bytes(&lo_bytes, scale_256),
+                self.fp8_e4m3_bytes(&hi_bytes, scale_256),
+            ]
+        };
+        self.remember(form, &[register], &halves);
         halves
     }
 
     /// The two FP8 bytes in the low 16 bits of `pair` as two halves, exactly: the lower byte in the
     /// lower half.
     pub(super) fn fp8_pair(&mut self, kind: Fp8, pair: &str) -> String {
-        let halves = self.fresh();
         if kind == Fp8::E5m2 {
             // The byte is the upper byte of the half it equals: byte 0 goes to byte 1 and byte 1
             // to byte 3, with zeros below them. One permutation of bytes (`PRMT`; three shifts
-            // and an `or` until 2026-11-18: the same halves for all 65,536 pairs
-            // of bytes on a V100).
+            // and an `or` until 2026-11-18: the same halves for all 65,536 pairs of bytes on a
+            // V100).
+            let halves = self.fresh();
             emit!(self, "prmt.b32 {halves}, {pair}, 0, 0x1404;");
             return halves;
         }
-        // One byte in the low byte of each half of the register.
-        let [low, high, bytes, sign, rest, placed, scale]: [String; 7] = self.fresh_n();
-        emit!(self, "and.b32 {low}, {pair}, 0xff;");
-        emit!(self, "and.b32 {high}, {pair}, 0xff00;");
-        emit!(self, "shl.b32 {high}, {high}, 8;");
-        emit!(self, "or.b32 {bytes}, {high}, {low};");
+        let bytes = self.fresh();
+        emit!(self, "prmt.b32 {bytes}, {pair}, 0, 0x4140;");
+        self.fp8_e4m3_bytes(&bytes, true)
+    }
+
+    /// Two E4M3 bytes unpacked at bits `[7:0]` and `[23:16]` of `bytes` (zero upper bytes) decoded
+    /// into packed `f16x2` halves, multiplied by 256 when `scale_256` is true.
+    fn fp8_e4m3_bytes(&mut self, bytes: &str, scale_256: bool) -> String {
+        let [sh7, sh8, placed, smask, nan, nmask, scale, halves]: [String; 8] = self.fresh_n();
         // As the bits of a half, the sign in bit 15 and the seven other bits in bits 13..7 are the
-        // value divided by 256, subnormal or not (the exponents of the formats differ by 8)...
-        emit!(self, "and.b32 {sign}, {bytes}, 0x00800080;");
-        emit!(self, "shl.b32 {sign}, {sign}, 8;");
-        emit!(self, "and.b32 {rest}, {bytes}, 0x007f007f;");
-        emit!(self, "shl.b32 {placed}, {rest}, 7;");
-        emit!(self, "or.b32 {placed}, {placed}, {sign};");
-        // ... which times 256 is a half again, exactly: one multiplication of the two halves at
-        // once (`HMUL2` on a V100, which takes subnormal halves as they are; each half went
-        // through f32 and back until 2026-11-18: the same halves for all 65,536
-        // pairs of bytes on a V100).
-        emit!(self, "mov.b32 {scale}, 0x5c005c00;");
-        emit!(self, "mul.rn.f16x2 {halves}, {placed}, {scale};");
-        // A byte whose seven bits are all ones is the NaN of the format, not 480: the bits 14..9 of
-        // its half are set, which makes it a NaN of the same sign.
-        let [nan, above, below]: [String; 3] = self.fresh_n();
-        emit!(self, "add.u32 {nan}, {rest}, 0x00010001;");
-        emit!(self, "and.b32 {nan}, {nan}, 0x00800080;");
-        emit!(self, "shl.b32 {above}, {nan}, 8;");
-        emit!(self, "shl.b32 {below}, {nan}, 2;");
-        emit!(self, "sub.u32 {nan}, {above}, {below};");
-        emit!(self, "or.b32 {halves}, {halves}, {nan};");
+        // value divided by 256, subnormal or not (the exponents of the formats differ by 8).
+        emit!(self, "shl.b32 {sh7}, {bytes}, 7;");
+        emit!(self, "shl.b32 {sh8}, {bytes}, 8;");
+        emit!(self, "and.b32 {placed}, {sh7}, 0x3f803f80;");
+        emit!(self, "mov.b32 {smask}, 0x80008000;");
+        emit!(self, "lop3.b32 {placed}, {placed}, {sh8}, {smask}, 0xF8;");
+        // A byte whose seven magnitude bits are all ones (0x7f / 0xff) is NaN, not 480: adding
+        // 0x0080 sets bit 14 iff bits 13..7 are all 1 (bit 14 is 0 in `placed`, so carry never
+        // reaches sign bit 15).
+        emit!(self, "add.u32 {nan}, {placed}, 0x00800080;");
+        if scale_256 {
+            // Multiplying `placed` by 256 (`0x5c005c00`) recovers the exact half in one `HMUL2` on
+            // a V100 (which takes subnormal halves as they are; each half went through f32 and back
+            // until 2026-11-18: the same halves for all 65,536 pairs of bytes on a V100, and this
+            // `prmt`/`lop3` form matches all 65,536 pairs bit-for-bit, NaN payloads included:
+            // `0x5f80 | 0x2000 = 0x7f80`, `0xdf80 | 0x2000 = 0xff80`).
+            emit!(self, "shr.u32 {nan}, {nan}, 1;");
+            emit!(self, "mov.b32 {scale}, 0x5c005c00;");
+            emit!(self, "mul.rn.f16x2 {halves}, {placed}, {scale};");
+            emit!(self, "mov.b32 {nmask}, 0x20002000;");
+            emit!(self, "lop3.b32 {halves}, {halves}, {nan}, {nmask}, 0xF8;");
+        } else {
+            // Defer the 2^8 factor to a power-of-two scale (UE8M0 in `kind::mxf8f6f4`); exact
+            // because Volta's `HMMA` takes f16 subnormal inputs without flushing (`fp8-bits` pins
+            // all 14 E4M3 subnormal bytes on a V100). NaN: `0x3f80 | 0x4000 = 0x7f80`.
+            emit!(self, "mov.b32 {nmask}, 0x40004000;");
+            emit!(self, "lop3.b32 {halves}, {placed}, {nan}, {nmask}, 0xF8;");
+        }
         halves
     }
 
     /// The FP8 byte nearest to the f32 `value`, ties to the even byte, in a fresh register: the
     /// largest finite one for what is beyond it (`.satfinite`), the NaN of the format for a NaN.
     ///
-    /// The value (divided by 256 for `e4m3`: see `fp8_pair`) is first cut to a half towards zero,
+    /// The value (divided by 256 for `e4m3`: see `fp8_e4m3_bytes`) is first cut to a half towards zero,
     /// with a bit that says whether something was cut off. The byte is that half without its low
     /// bits, rounded on them and on that bit: one rounding, of the value itself. (Rounding to a half
     /// first and then to the byte would round twice.)

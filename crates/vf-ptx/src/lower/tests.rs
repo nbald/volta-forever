@@ -1597,10 +1597,11 @@ fn fp8_values_become_halves_where_they_are() {
     // e4m3: both halves times 256 in one multiplication, and the NaN byte made a NaN.
     let e4m3 = lower("{\n\t.reg .b16 %rs1;\n\t.reg .b32 %r1;\n\t@%p1 cvt.rn.f16x2.e4m3x2 %r1, %rs1;\n\tret;\n}");
     assert_eq!(count(&e4m3, "e4m3"), 0);
+    assert_eq!(count(&e4m3, "prmt.b32 "), 1);
     assert_eq!(count(&e4m3, "mul.rn.f16x2 "), 1);
-    assert_eq!(count(&e4m3, ", 0x5c005c00;"), 1);
+    assert_eq!(count(&e4m3, "0x5c005c00;"), 1);
     assert_eq!(count(&e4m3, "cvt.rn.f16.f32 "), 0);
-    assert_eq!(count(&e4m3, "0x00010001"), 1);
+    assert_eq!(count(&e4m3, "0x00800080"), 1);
     // The guard is on the statement that writes the register of the program, and only there.
     assert_eq!(count(&e4m3, "@%p1 "), 1);
     assert!(e4m3.contains("\t@%p1 mov.b32 %r1, %vf_r"));
@@ -1829,7 +1830,7 @@ fn an_fp8_product_is_four_fp16_products_of_the_halves() {
         // one multiplication of its two halves, an e5m2 pair by one permutation of bytes.
         let multiplied = 2 * (4 * (a_type == "e4m3") as usize + 2 * (b_type == "e4m3") as usize);
         assert_eq!(count(&lowered, "mul.rn.f16x2 "), multiplied, "{a_type} {b_type}");
-        assert_eq!(count(&lowered, "prmt.b32 "), 12 - multiplied, "{a_type} {b_type}");
+        assert_eq!(count(&lowered, "prmt.b32 "), 12, "{a_type} {b_type}");
         assert_eq!(count(&lowered, "mul.f32 "), 0);
         // The shuffles are those of four FP16 products: five for each B operand.
         assert_eq!(count(&lowered, "shfl."), 4 * 5, "{a_type} {b_type}");
@@ -4149,6 +4150,89 @@ fn a_product_with_b_by_ldmatrix_trans_is_summed_on_even_and_odd_k() {
     assert_eq!(paired, lower_aligned(text));
     assert_eq!(count(&paired, HALVES_F32), 4);
     assert_eq!(count(&paired, VOLTA_F32), 4);
+}
+
+#[test]
+fn fp8_e4m3_decode_uses_prmt_lop3_without_sub() {
+    for dst in ["f16x2", "bf16x2"] {
+        let pair = lower(&format!(
+            "{{\n\t.reg .b16 %rs1;\n\t.reg .b32 %r1;\n\tcvt.rn.{dst}.e4m3x2 %r1, %rs1;\n\tret;\n}}"
+        ));
+        assert_eq!(
+            count(&pair, "prmt.b32 "),
+            1,
+            "{dst}: expected 0x4140 prmt unpack:\n{pair}"
+        );
+        assert_eq!(count(&pair, "lop3.b32 "), 2, "{dst}: expected 2 lop3 ops:\n{pair}");
+        assert_eq!(
+            count(&pair, "sub.u32 "),
+            0,
+            "{dst}: unexpected sub.u32 NaN mask:\n{pair}"
+        );
+        assert_eq!(count(&pair, "0x00800080"), 1, "{dst}:\n{pair}");
+        assert_eq!(undeclared(&pair), Vec::<String>::new(), "{dst}");
+    }
+
+    let mma = lower(
+        "{\n\tmma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%d0, %d1, %d2, %d3}, {%a0, %a1, %a2, %a3}, {%b0, %b1}, {%c0, %c1, %c2, %c3};\n\tret;\n}",
+    );
+    assert_eq!(
+        count(&mma, ", %a"),
+        8,
+        "only 8 prmt.b32 unpacking reads from %a0..%a3:\n{mma}"
+    );
+    assert_eq!(
+        count(&mma, "shr.u32 %vf_r"),
+        16,
+        "12 NaN shifts + 4 column splits, no shr 16 unpack:\n{mma}"
+    );
+    assert_eq!(undeclared(&mma), Vec::<String>::new());
+}
+
+#[test]
+fn mxf8_block_scaled_defers_hmul2_and_keeps_eight_step_chain() {
+    // e4m3 x e4m3: omits all HMUL2, folds +16 into scale_A's UE8M0 bias (896 + 16 = 912), and
+    // keeps main's single 8-step Volta summation chain (no split-octet re-association / add.f32).
+    let e4_e4 = lower(
+        "{\n\t.reg .b32 %d<4>, %a<4>, %b<2>, %c<4>, %sa, %sb;\n\tmma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.f32.e4m3.e4m3.f32.ue8m0 {%d0, %d1, %d2, %d3}, {%a0, %a1, %a2, %a3}, {%b0, %b1}, {%c0, %c1, %c2, %c3}, %sa, {0, 0}, %sb, {0, 0};\n\tret;\n}",
+    );
+    assert_eq!(
+        count(&e4_e4, "mul.rn.f16x2 "),
+        0,
+        "expected deferred UE8M0 scale fold without HMUL2:\n{e4_e4}"
+    );
+    assert_eq!(
+        count(&e4_e4, ", 912;"),
+        2,
+        "expected +16 UE8M0 bias (912) on scale_A lower/upper:\n{e4_e4}"
+    );
+    assert_eq!(
+        count(&e4_e4, "mma.sync.aligned.m8n8k4.col.row.f32.f16.f16.f32"),
+        8,
+        "expected main's 8-step col.row m8n8k4 chain (not split-octet re-association):\n{e4_e4}"
+    );
+    assert_eq!(
+        count(&e4_e4, "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32"),
+        0,
+        "unexpected split-octet row.col re-association:\n{e4_e4}"
+    );
+    assert_eq!(
+        count(&e4_e4, "add.f32 "),
+        0,
+        "unexpected partial-sum f32 re-association add:\n{e4_e4}"
+    );
+    assert_eq!(undeclared(&e4_e4), Vec::<String>::new());
+
+    // e4m3 x e5m2: folds +8 (896 + 8 = 904) into scale_A and still uses 0 HMUL2 + 8-step chain.
+    let e4_e5 = lower(
+        "{\n\t.reg .b32 %d<4>, %a<4>, %b<2>, %c<4>, %sa, %sb;\n\tmma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.f32.e4m3.e5m2.f32.ue8m0 {%d0, %d1, %d2, %d3}, {%a0, %a1, %a2, %a3}, {%b0, %b1}, {%c0, %c1, %c2, %c3}, %sa, {0, 0}, %sb, {0, 0};\n\tret;\n}",
+    );
+    assert_eq!(count(&e4_e5, "mul.rn.f16x2 "), 0);
+    assert_eq!(count(&e4_e5, ", 904;"), 2);
+    assert_eq!(count(&e4_e5, "mma.sync.aligned.m8n8k4.col.row.f32.f16.f16.f32"), 8);
+    assert_eq!(count(&e4_e5, "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32"), 0);
+    assert_eq!(count(&e4_e5, "add.f32 "), 0);
+    assert_eq!(undeclared(&e4_e5), Vec::<String>::new());
 }
 
 #[test]

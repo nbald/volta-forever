@@ -10,11 +10,9 @@
 ### Changed
 
 - Under `VF_ALIGNED_ROWS=0`, a forward low-zero-bits dataflow pass over the PTX control-flow graph elides the per-load runtime 16-byte alignment check on `ldmatrix` instructions whose addresses are statically proven 16-byte aligned across all paths from function entry (`docs/emulations.md`).
-
-### Changed
-
 - The proxy cache now stores LZ4-compressed retargeted PTX/fatbin images (`.p`) so subsequent starts skip re-adapting cached modules and libraries materialized on fallback, validates bounded decompressed lengths, keys restored lazy libraries by each load's own policy, and tracks directory size incrementally instead of rescanning on every cache write.
 - Driver hook call counters (`COUNTS`) are incremented only when statistics are asked for (`VF_STATS`).
+- FP8 decoding (`cvt.rn.{f16x2,bf16x2}.e4m3x2`, plain `m16n8k32` FP8 products, and `kind::mxf8f6f4` operand decode) unpacks `e4m3` and upper `e5m2` bytes with `prmt.b32` and merges `e4m3` sign/NaN bits with `lop3.b32` (removing bit-mask shifts, `shr.u32` upper-pair unpacks, and `sub.u32` NaN masks), and `kind::mxf8f6f4` folds `e4m3`'s `2^8` factor into UE8M0's exponent bias (omitting `HMUL2`) while keeping the 8-step Volta summation chain so every decode, plain FP8 product, and `kind::mxf8f6f4` product stays bit-for-bit identical (`tests/gpu/run.sh`: `fp8-bits`).
 
 ### Tests
 
